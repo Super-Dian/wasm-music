@@ -198,6 +198,7 @@ onUnmounted(() => {
   max-height: 90vh;
   display: flex;
   flex-direction: column;
+  transition: width 0.3s ease;
 }
 
 .ui-modal-fullscreen {

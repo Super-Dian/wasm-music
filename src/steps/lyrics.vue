@@ -1131,6 +1131,7 @@ function openWorkshop(item?: SubTitle) {
 </script>
 
 <template>
+  <div>
   <UiSpin :loading="!fromData.playerData && !error">
     <form @submit.prevent>
       <div class="lyrics-workshop-container" v-if="fromData.playerData">
@@ -1450,6 +1451,7 @@ function openWorkshop(item?: SubTitle) {
       </UiTabs>
     </div>
   </UiModal>
+  </div>
 </template>
 
 <style>

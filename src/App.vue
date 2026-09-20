@@ -30,6 +30,13 @@ import type { EpisodeVideoData, EpisodeSelection } from "./episode";
 const visible = ref(true);
 /** 0=picker(仅多集), 1=clip, 2=info, 3=cover, 4=lyrics, 5=audio */
 const current = ref(1);
+const prevCurrent = ref(current.value);
+const transitionName = computed(() =>
+  current.value > prevCurrent.value ? "step-slide-left" : "step-slide-right",
+);
+watch(current, (_, oldVal) => {
+  prevCurrent.value = oldVal;
+});
 const preparing = ref(true);
 const preparingLabel = ref("正在准备下载信息…");
 const batchStatus = ref("");
@@ -304,25 +311,27 @@ function onOpen() {
           :title="fromData.err"
           subtitle="您可以重新打开弹窗, 重新获取数据, 或者刷新页面. 如果多次且更换视频也无法使用请联系开发者"
         />
-        <component
-          v-else
-          :is="steps[current]"
-          v-bind="
-            current === 0 && hasPickerStep
-              ? {
-                  episodes: episodeSession.allEpisodes,
-                  currentIndex: episodeSession.currentEpisodeIndex,
-                  pickerMeta: episodeSession.pickerMeta,
-                  savedRule: getActiveDefaultRule(),
-                }
-              : {}
-          "
-          @prev="onPrev"
-          @next="onNext"
-          @backToPicker="handleBackToPicker"
-          @confirm="onPickerConfirm"
-          @cancel="onPickerCancel"
-        />
+        <Transition v-else :name="transitionName" mode="out-in">
+          <component
+            :is="steps[current]"
+            :key="current"
+            v-bind="
+              current === 0 && hasPickerStep
+                ? {
+                    episodes: episodeSession.allEpisodes,
+                    currentIndex: episodeSession.currentEpisodeIndex,
+                    pickerMeta: episodeSession.pickerMeta,
+                    savedRule: getActiveDefaultRule(),
+                  }
+                : {}
+            "
+            @prev="onPrev"
+            @next="onNext"
+            @backToPicker="handleBackToPicker"
+            @confirm="onPickerConfirm"
+            @cancel="onPickerCancel"
+          />
+        </Transition>
       </div>
     </div>
   </UiModal>
@@ -338,5 +347,49 @@ function onOpen() {
   font-size: 13px;
   line-height: 20px;
   text-align: left;
+}
+
+.step-content {
+  overflow: hidden;
+}
+
+/* 步骤前进动画（向左滑出 + 向左滑入） */
+.step-slide-left-enter-active {
+  transition:
+    transform 0.35s ease-out,
+    opacity 0.35s ease-out;
+}
+.step-slide-left-leave-active {
+  transition:
+    transform 0.25s ease-in,
+    opacity 0.25s ease-in;
+}
+.step-slide-left-enter-from {
+  transform: translateX(40px);
+  opacity: 0;
+}
+.step-slide-left-leave-to {
+  transform: translateX(-40px);
+  opacity: 0;
+}
+
+/* 步骤后退动画（向右滑出 + 向右滑入） */
+.step-slide-right-enter-active {
+  transition:
+    transform 0.35s ease-out,
+    opacity 0.35s ease-out;
+}
+.step-slide-right-leave-active {
+  transition:
+    transform 0.25s ease-in,
+    opacity 0.25s ease-in;
+}
+.step-slide-right-enter-from {
+  transform: translateX(-40px);
+  opacity: 0;
+}
+.step-slide-right-leave-to {
+  transform: translateX(40px);
+  opacity: 0;
 }
 </style>
