@@ -133,17 +133,19 @@ function next() {
 
 onMounted(() => {
   if (!fromData.videoData) return;
+
+  // 缓存命中：playerData 已存在（含已解析的字幕），直接恢复本地状态
+  if (fromData.playerData?.subtitle?.subtitles?.length) {
+    const cached = fromData.playerData.subtitle.subtitles;
+    subtitles.value = cached;
+    // 阻止 UiSpin 显示加载状态
+    return;
+  }
+
   const cid = fromData.videoData.cid.toString();
   const bvid = fromData.videoData.bvid;
   const aid = fromData.videoData.aid.toString();
   logger.debug({ cid, bvid, aid });
-  // if (fromData.data) {
-  //   request.get({ url: fromData.data.mv_lyric }).then((res) => {
-  //     if (!fromData.data) return;
-  //     logger.debug(fromData.data.mv_lyric, res);
-  //     fromData.data.mv_lyric_data = res;
-  //   });
-  // }
   request
     .get({
       url:
