@@ -176,6 +176,32 @@ const selectedInfo = computed(() => {
   return `第 ${i + 1}/${workingLines.value.length} 句 · ${formatMsFull(t)} · ${text}`;
 });
 
+/** 当前歌词预览行（activeIndex 驱动：仅播放头跨句/表变更时重算） */
+type PreviewRow = { i: number; time: string; text: string };
+
+function makePreviewRow(i: number): PreviewRow {
+  const line = workingLines.value[i];
+  if (!line) return { i, time: "--:--", text: "" };
+  return { i, time: formatMsShort(line[0]), text: line[1] };
+}
+
+const previewCurrentRow = computed<PreviewRow | null>(() => {
+  const idx = activeIndex.value;
+  return idx >= 0 && idx < workingLines.value.length ? makePreviewRow(idx) : null;
+});
+
+const previewPrevRow = computed<PreviewRow | null>(() => {
+  const idx = activeIndex.value;
+  return idx > 0 && idx < workingLines.value.length ? makePreviewRow(idx - 1) : null;
+});
+
+const previewNextRow = computed<PreviewRow | null>(() => {
+  const idx = activeIndex.value;
+  // 播放头在第一句之前时，把第一句当下一句展示
+  const nextIdx = idx < 0 ? 0 : idx + 1;
+  return nextIdx < workingLines.value.length ? makePreviewRow(nextIdx) : null;
+});
+
 function cloneLines(lines: Lyrics): Lyrics {
   return lines.map(([t, s]): [number, string] => [t, s]);
 }
@@ -231,6 +257,9 @@ function updateActiveIndex() {
 }
 
 watch([viewStartMs, pxPerSec], syncPlayheadDom);
+
+// 时间表被整体改写（commit/整体偏移/重同步）后，播放指针所在的行可能变化，重算活跃行
+watch(workingLines, updateActiveIndex);
 
 function seekTo(ms: number) {
   displayTimeMs = Math.max(0, ms);
@@ -656,6 +685,48 @@ onUnmounted(() => {
     </div>
     <UiAlert v-else type="info">暂无歌词时间轴数据，请先加载歌词。</UiAlert>
 
+    <!-- 当前歌词预览：跟随播放指针所在句（上一句/当前句/下一句），点击任意行跳转试听。
+         固定行高 + 单行省略，行切换与左面板开合引起的宽度变化都不造成布局抖动 -->
+    <div
+      v-if="workingLines.length"
+      class="lt-preview"
+      title="跟随播放指针的当前歌词，点击可跳转试听"
+    >
+      <div
+        v-if="previewPrevRow"
+        class="lt-preview-row lt-preview-prev"
+        @click="previewPrevRow && seekTo(workingLines[previewPrevRow.i][0])"
+      >
+        <span class="lt-preview-time">{{ previewPrevRow.time }}</span>
+        <span class="lt-preview-text">{{ previewPrevRow.text || "♪" }}</span>
+      </div>
+      <div
+        class="lt-preview-row lt-preview-current"
+        :class="{ 'lt-preview-empty': !previewCurrentRow }"
+        @click="previewCurrentRow && seekTo(workingLines[previewCurrentRow.i][0])"
+      >
+        <template v-if="previewCurrentRow">
+          <span class="lt-preview-time">{{ previewCurrentRow.time }}</span>
+          <span class="lt-preview-text">{{ previewCurrentRow.text || "♪" }}</span>
+          <span class="lt-preview-index">
+            {{ previewCurrentRow.i + 1 }}/{{ workingLines.length }}
+          </span>
+        </template>
+        <template v-else>
+          <span class="lt-preview-time">--:--</span>
+          <span class="lt-preview-text">尚未播放到歌词</span>
+        </template>
+      </div>
+      <div
+        v-if="previewNextRow"
+        class="lt-preview-row lt-preview-next"
+        @click="previewNextRow && seekTo(workingLines[previewNextRow.i][0])"
+      >
+        <span class="lt-preview-time">{{ previewNextRow.time }}</span>
+        <span class="lt-preview-text">{{ previewNextRow.text || "♪" }}</span>
+      </div>
+    </div>
+
     <div class="lt-status">
       <span ref="timeEl" class="lt-status-time">00:00.000</span>
       <span class="lt-status-sel">{{ selectedInfo || "未选中行" }}</span>
@@ -802,6 +873,100 @@ onUnmounted(() => {
   padding-right: 8px;
 }
 
+/* 当前歌词预览：宽度 100% 随右列（左面板开合）自适应；
+   固定行高 + 单行省略，跨句切换与宽度变化不引起布局抖动 */
+.lt-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--color-bili-border, #e3e5e7);
+  border-radius: 6px;
+  background: var(--color-bili-bg, #fff);
+}
+
+.lt-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--color-bili-text-muted, #999);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.lt-preview-row:hover {
+  background: rgba(0, 174, 236, 0.08);
+}
+
+.lt-preview-prev,
+.lt-preview-next {
+  opacity: 0.7;
+}
+
+.lt-preview-current {
+  height: 34px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--color-bili-text, #18191c);
+  background: rgba(0, 174, 236, 0.1);
+}
+
+.lt-preview-current:hover {
+  background: rgba(0, 174, 236, 0.16);
+}
+
+.lt-preview-empty {
+  background: transparent;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-bili-text-muted, #999);
+  cursor: default;
+}
+
+.lt-preview-empty:hover {
+  background: transparent;
+}
+
+.lt-preview-time {
+  flex: none;
+  min-width: 44px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-bili-blue, #00aeec);
+  opacity: 0.85;
+}
+
+.lt-preview-current .lt-preview-time {
+  font-size: 14px;
+}
+
+.lt-preview-empty .lt-preview-time {
+  color: var(--color-bili-text-muted, #999);
+  opacity: 1;
+}
+
+.lt-preview-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lt-preview-index {
+  flex: none;
+  font-size: 12px;
+  font-weight: 400;
+  opacity: 0.6;
+  color: var(--color-bili-text-secondary, #666);
+}
+
 .lt-clip-mask {
   position: absolute;
   top: 0;
@@ -912,6 +1077,49 @@ body[data-theme="dark"] .lt-status {
 body[arco-theme="dark"] .lt-status-hint,
 body[data-theme="dark"] .lt-status-hint {
   color: #666;
+}
+
+body[arco-theme="dark"] .lt-preview,
+body[data-theme="dark"] .lt-preview {
+  background: #1f1f1f;
+  border-color: #444;
+}
+
+body[arco-theme="dark"] .lt-preview-row,
+body[data-theme="dark"] .lt-preview-row {
+  color: #666;
+}
+
+body[arco-theme="dark"] .lt-preview-row:hover,
+body[data-theme="dark"] .lt-preview-row:hover {
+  background: rgba(0, 174, 236, 0.12);
+}
+
+body[arco-theme="dark"] .lt-preview-current,
+body[data-theme="dark"] .lt-preview-current {
+  color: #e0e0e0;
+  background: rgba(0, 174, 236, 0.16);
+}
+
+body[arco-theme="dark"] .lt-preview-current:hover,
+body[data-theme="dark"] .lt-preview-current:hover {
+  background: rgba(0, 174, 236, 0.22);
+}
+
+body[arco-theme="dark"] .lt-preview-empty,
+body[data-theme="dark"] .lt-preview-empty {
+  background: transparent;
+  color: #666;
+}
+
+body[arco-theme="dark"] .lt-preview-empty:hover,
+body[data-theme="dark"] .lt-preview-empty:hover {
+  background: transparent;
+}
+
+body[arco-theme="dark"] .lt-preview-index,
+body[data-theme="dark"] .lt-preview-index {
+  color: #999;
 }
 
 body[arco-theme="dark"] .lt-divider,
