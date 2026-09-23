@@ -14,6 +14,7 @@ declare module 'vue' {
     FloatingEntry: typeof import('./src/components/FloatingEntry.vue')['default']
     Info: typeof import('./src/steps/info.vue')['default']
     Lyrics: typeof import('./src/steps/lyrics.vue')['default']
+    LyricsTimeline: typeof import('./src/components/LyricsTimeline.vue')['default']
     Picker: typeof import('./src/steps/picker.vue')['default']
     TaskCenter: typeof import('./src/components/TaskCenter.vue')['default']
     UiAlert: typeof import('./src/components/UiAlert.vue')['default']

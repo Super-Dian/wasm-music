@@ -25,7 +25,9 @@ export default defineConfig({
     Components({
       dts: true,
       dirs: ["src/steps", "src/components"],
-      include: /.vue$/,
+      // 不要自定义 include：自定义值会替换插件默认的
+      // [ /\.vue$/, /\.vue\?vue/, /\.vue\?v=/ ]，导致生产构建中带查询串的
+      // TS SFC 子请求（Foo.vue?vue&type=script&lang.ts）匹配失败、组件注入失效
     }),
     {
       name: "replace-url",

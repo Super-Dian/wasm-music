@@ -12,8 +12,12 @@ import UiTextarea from "@/components/UiTextarea.vue";
 import UiSpin from "@/components/UiSpin.vue";
 import UiAlert from "@/components/UiAlert.vue";
 import UiSelect from "@/components/UiSelect.vue";
+import UiResult from "@/components/UiResult.vue";
 import UiModal from "@/components/UiModal.vue";
 import UiTabs from "@/components/UiTabs.vue";
+// 显式导入（与仓库其它文件一致）：构建模式下 unplugin-vue-components
+// 不注入该组件，回退 resolveComponent 会因未注册而渲染为空白
+import LyricsTimeline from "@/components/LyricsTimeline.vue";
 import { Message } from "@/utils/message";
 
 interface SelectOption {
@@ -240,6 +244,8 @@ const onlineYrc = ref<string>("");
 
 /** 当前激活的 tab */
 const activeTab = ref("1");
+/** tab4 时间轴页是否临时显示左侧歌词文本面板（会话内持久，不跨会话存储） */
+const showTimelineText = ref(false);
 
 /** 是否显示 OpenAI 设置面板 */
 const showOpenAISettings = ref(false);
@@ -257,6 +263,12 @@ const cachedNormalLyrics = ref("");
 
 /** 在线歌词原始解析结果（未偏移），用于 offset 计算基准 */
 const originalParsedLyrics = ref<Array<[number, string]>>([]);
+/**
+ * 时间轴（Tab 4）是否手动编辑过 _lyricsBody。
+ * 为 true 时 handleOk / 开始时间 不得再从 textarea/YRC 快照整表重写 _lyricsBody，
+ * 否则会吞掉行级拖拽编辑。任何整表重建 _lyricsBody 的函数都应将其重置为 false。
+ */
+const timelineDirty = ref(false);
 
 /**
  * 切换使用在线歌词状态
@@ -313,15 +325,19 @@ function parseLyricsStartTime(timeStr: string): number | null {
 }
 
 /**
- * 当开始时间输入变化时，实时调整歌词时间轴
+ * 当开始时间输入变化时，实时调整歌词时间轴。
+ * 相对「当前首行」做整体 delta 平移（幂等：同值重复输入 → delta=0），
+ * 保留时间轴已有的行级相对编辑；不再从 pristine 快照整表重放。
+ * 注：UiInput 的 change 事件运行时可能传出原生 Event，此处同时兼容。
  */
-function onLyricsStartTimeChange(value: string) {
-  if (!value) {
+function onLyricsStartTimeChange(value: string | Event) {
+  const timeStr = typeof value === "string" ? value : lyricsStartTime.value;
+  if (!timeStr) {
     lyricsStartTimeError.value = true;
     return;
   }
 
-  const startTimeMs = parseLyricsStartTime(value);
+  const startTimeMs = parseLyricsStartTime(timeStr);
   if (startTimeMs === null) {
     lyricsStartTimeError.value = true;
     return;
@@ -329,26 +345,8 @@ function onLyricsStartTimeChange(value: string) {
 
   lyricsStartTimeError.value = false;
 
-  // 在线模式始终从未偏移的 LRC 时间轴重新计算，避免重复修改产生累积偏移。
-  if (lyricsMode.value === "online" && originalParsedLyrics.value.length > 0) {
-    const offset = startTimeMs - originalParsedLyrics.value[0][0];
-    editLyricsData.value!.data!._lyricsBody = originalParsedLyrics.value.map(([time, text]) => [
-      Math.max(0, time + offset),
-      text,
-    ]);
-    // 同步更新 Enhanced LRC 时间偏移
-    if (fromData.enhancedLrc && onlineYrc.value) {
-      const wordLyrics = parseYrc(onlineYrc.value);
-      if (wordLyrics.length > 0) {
-        const adjusted: WordLyrics = wordLyrics.map((line) => ({
-          ...line,
-          startMs: Math.max(0, line.startMs + offset),
-          words: line.words.map((w) => ({ ...w, startMs: Math.max(0, w.startMs + offset) })),
-        }));
-        fromData.enhancedLrc = wordLyricsToEnhancedLrc(adjusted);
-      }
-    }
-  }
+  if (lyricsMode.value !== "online") return;
+  applyGlobalStartTimeDelta(startTimeMs);
 }
 
 /**
@@ -376,6 +374,101 @@ function parseLrcToLyrics(lrcText: string): Array<[number, string]> {
   }
 
   return result.sort((a, b) => a[0] - b[0]);
+}
+
+/** 将毫秒格式化为与「开始时间」输入一致的 mm:ss.mmm */
+function formatStartTimeMs(ms: number): string {
+  const v = Math.max(0, Math.round(ms));
+  const m = Math.floor(v / 60000);
+  const s = Math.floor((v % 60000) / 1000);
+  const f = v % 1000;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}`;
+}
+
+/**
+ * 对 Enhanced LRC 字符串整体平移所有时间标签（[mm:ss.mmm] 行标签与 <mm:ss.mmm> 字标签）。
+ * parseYrc 只能解析 YRC 原始格式、无法回读 enhancedLrc，故直接对字符串做绝对平移：
+ * 不依赖 raw 基线、保留既有偏移，且每次只叠加当次 delta。
+ */
+function shiftEnhancedLrc(deltaMs: number) {
+  if (!fromData.useEnhancedLyrics || !fromData.enhancedLrc || !deltaMs) return;
+  fromData.enhancedLrc = fromData.enhancedLrc.replace(
+    /([<[])(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?([>\]])/g,
+    (_m, open: string, mm: string, ss: string, frac: string | undefined, close: string) => {
+      const base = Number(mm) * 60000 + Number(ss) * 1000 + Number((frac ?? "0").padEnd(3, "0"));
+      const ms = Math.max(0, base + deltaMs);
+      const m = Math.floor(ms / 60000);
+      const s = Math.floor((ms % 60000) / 1000);
+      const f = ms % 1000;
+      return `${open}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}${close}`;
+    },
+  );
+}
+
+/**
+ * 将整表对齐到目标首行时间（全局 delta 平移，保留行级相对编辑）。
+ * @returns 是否执行了处理（无可用 _lyricsBody 时 false）
+ */
+function applyGlobalStartTimeDelta(startTimeMs: number): boolean {
+  const data = editLyricsData.value?.data;
+  if (!data?._lyricsBody?.length) return false;
+  const delta = startTimeMs - data._lyricsBody[0][0];
+  if (delta === 0) return true;
+  data._lyricsBody = data._lyricsBody.map(([t, s]) => [Math.max(0, t + delta), s]);
+  shiftEnhancedLrc(delta);
+  timelineDirty.value = true;
+  return true;
+}
+
+/**
+ * 物化当前模式下的时间轴行（与 next() 的三模式取数逻辑同构）。
+ * online → _lyricsBody（空时兜底解析右侧编辑框）；
+ * ai-corrected → _lyricsBody；
+ * ai → body[i].from ↔ _editBody 行。
+ */
+function getTimelineLines(): Lyrics {
+  const data = editLyricsData.value?.data;
+  if (!data) return [];
+  if (lyricsMode.value === "online") {
+    if (data._lyricsBody?.length) return data._lyricsBody;
+    return parseLrcToLyrics(editableOnlineLyrics.value);
+  }
+  if (lyricsMode.value === "ai-corrected" && data._lyricsBody?.length) {
+    return data._lyricsBody;
+  }
+  const editLines = (data._editBody ?? "").split("\n");
+  return data.body.map((item, index) => [
+    Math.round(item.from * 1000),
+    editLines[index] ?? item.content,
+  ]);
+}
+
+/** 时间轴（Tab 4）初值与行数校验基线 */
+const timelineLines = computed(() => getTimelineLines());
+
+/**
+ * LyricsTimeline 的 commit 写回：行数守恒校验 → _lyricsBody →
+ * ai 模式提升为 ai-corrected（否则 next() 只读 body[].from 会静默丢弃编辑）→
+ * 同步开始时间输入与逐字歌词。
+ */
+function onTimelineCommit(next: Lyrics, globalDelta?: number) {
+  const data = editLyricsData.value?.data;
+  if (!data) return;
+  const expected = getTimelineLines().length;
+  if (next.length === 0 || next.length !== expected) {
+    Message.error("时间轴行数与歌词不一致");
+    return;
+  }
+  const normalized: Lyrics = next.map(([ms, t]) => [Math.max(0, Math.round(ms)), t]);
+  data._lyricsBody = normalized;
+  if (lyricsMode.value === "ai") {
+    lyricsMode.value = "ai-corrected";
+    subtitleEditMode.value = "ai-corrected";
+  }
+  timelineDirty.value = true;
+  lyricsStartTime.value = formatStartTimeMs(normalized[0][0]);
+  lyricsStartTimeError.value = false;
+  if (globalDelta) shiftEnhancedLrc(globalDelta);
 }
 
 const diffFunc = {
@@ -708,6 +801,7 @@ function replaceWithOnlineLyrics() {
       useOnlineLyrics.value = false;
       editLyricsData.value.data._lyricsBody = [];
       originalParsedLyrics.value = [];
+      timelineDirty.value = false;
       return;
     }
 
@@ -718,6 +812,8 @@ function replaceWithOnlineLyrics() {
 
     editLyricsData.value.data._lyricsBody = parsedLyrics;
     editLyricsData.value.data._editBody = parsedLyrics.map(([, text]) => text).join("\n");
+    // 整表重建时间轴基线：清除时间轴编辑记账
+    timelineDirty.value = false;
 
     const firstTimeMs = parsedLyrics[0][0];
     const minutes = Math.floor(firstTimeMs / 60000);
@@ -737,6 +833,7 @@ function undoReplaceLyrics() {
   if (!editLyricsData.value?.data || !originalAiText.value) return;
   editLyricsData.value.data._editBody = originalAiText.value;
   editLyricsData.value.data._lyricsBody = [];
+  timelineDirty.value = false;
   lyricsMode.value = "ai";
   subtitleEditMode.value = "ai";
   originalEditBody.value = "";
@@ -779,6 +876,7 @@ function applyEnhancedLyrics() {
   editLyricsData.value.data._editBody = wordLyrics.map((line) => line.text).join("\n");
   // 行级歌词用于音频嵌入时的兼容处理
   editLyricsData.value.data._lyricsBody = wordLyrics.map((line) => [line.startMs, line.text]);
+  timelineDirty.value = false;
 
   fromData.enhancedLrc = enhancedLrc;
   fromData.useEnhancedLyrics = true;
@@ -808,6 +906,7 @@ function smartCorrectLyrics() {
       editLyricsData.value!.data!._editBody = originalEditBody.value;
     }
     editLyricsData.value!.data!._lyricsBody = [];
+    timelineDirty.value = false;
     lyricsMode.value = "ai";
     subtitleEditMode.value = "ai";
     originalEditBody.value = "";
@@ -837,6 +936,7 @@ function smartCorrectLyrics() {
   originalEditBody.value = editLyricsData.value.data._editBody ?? originalAiText.value;
   editLyricsData.value.data._lyricsBody = lyrics;
   editLyricsData.value.data._editBody = lyrics.map((item) => item[1]).join("\n");
+  timelineDirty.value = false;
   lyricsMode.value = "ai-corrected";
   subtitleEditMode.value = "ai-corrected";
   originalParsedLyrics.value = [];
@@ -861,37 +961,62 @@ function handleOk() {
       return;
     }
 
+    const data = editLyricsData.value!.data!;
+
     if (fromData.useEnhancedLyrics && onlineYrc.value) {
-      // 逐字歌词：重新解析 YRC 并应用偏移
-      const wordLyrics = parseYrc(onlineYrc.value);
-      if (wordLyrics.length === 0) {
-        Message.error("逐字歌词解析失败");
-        return;
+      if (timelineDirty.value && data._lyricsBody?.length) {
+        // 时间轴已编辑：行级时间以 _lyricsBody 为准，跳过 YRC 整表重写（会吞掉行级拖拽）；
+        // 仅做首行与开始时间的防御性全局对齐 + 左侧文本行数自愈
+        applyGlobalStartTimeDelta(startTimeMs);
+        const editLines = (data._editBody ?? "").split("\n");
+        if (editLines.length !== data._lyricsBody.length) {
+          Message.warning("歌词行数与时间轴不一致，已按时间轴文本同步");
+          data._editBody = data._lyricsBody.map(([, text]) => text).join("\n");
+        }
+      } else {
+        // 逐字歌词：重新解析 YRC 并应用偏移
+        const wordLyrics = parseYrc(onlineYrc.value);
+        if (wordLyrics.length === 0) {
+          Message.error("逐字歌词解析失败");
+          return;
+        }
+        const offset = startTimeMs - wordLyrics[0].startMs;
+        const adjusted: WordLyrics = wordLyrics.map((line) => ({
+          ...line,
+          startMs: Math.max(0, line.startMs + offset),
+          words: line.words.map((w) => ({ ...w, startMs: Math.max(0, w.startMs + offset) })),
+        }));
+        fromData.enhancedLrc = wordLyricsToEnhancedLrc(adjusted);
+        data._lyricsBody = adjusted.map((line) => [line.startMs, line.text]);
+        data._editBody = adjusted.map((line) => line.text).join("\n");
+        originalParsedLyrics.value = adjusted.map((line) => [line.startMs, line.text]);
       }
-      const offset = startTimeMs - wordLyrics[0].startMs;
-      const adjusted: WordLyrics = wordLyrics.map((line) => ({
-        ...line,
-        startMs: Math.max(0, line.startMs + offset),
-        words: line.words.map((w) => ({ ...w, startMs: Math.max(0, w.startMs + offset) })),
-      }));
-      fromData.enhancedLrc = wordLyricsToEnhancedLrc(adjusted);
-      editLyricsData.value!.data!._lyricsBody = adjusted.map((line) => [line.startMs, line.text]);
-      editLyricsData.value!.data!._editBody = adjusted.map((line) => line.text).join("\n");
-      originalParsedLyrics.value = adjusted.map((line) => [line.startMs, line.text]);
     } else {
-      // 普通歌词
       const parsedLyrics = parseLrcToLyrics(editableOnlineLyrics.value);
-      if (parsedLyrics.length === 0) {
-        Message.error("在线歌词时间轴无效，请开启时间轴后再使用");
-        return;
+      if (timelineDirty.value && data._lyricsBody?.length) {
+        // 时间轴已编辑：时间保留 _lyricsBody，文本以右侧编辑框为准（行数一致时）
+        if (parsedLyrics.length === data._lyricsBody.length) {
+          data._lyricsBody = data._lyricsBody.map(([time], index): [number, string] => [
+            time,
+            parsedLyrics[index][1],
+          ]);
+          data._editBody = parsedLyrics.map(([, text]) => text).join("\n");
+        } else {
+          Message.warning("在线歌词文本行数与时间轴不一致，已保留时间轴编辑");
+          data._editBody = data._lyricsBody.map(([, text]) => text).join("\n");
+        }
+        applyGlobalStartTimeDelta(startTimeMs);
+      } else {
+        // 普通歌词（未触碰时间轴时走原有路径）
+        if (parsedLyrics.length === 0) {
+          Message.error("在线歌词时间轴无效，请开启时间轴后再使用");
+          return;
+        }
+        const offset = startTimeMs - parsedLyrics[0][0];
+        originalParsedLyrics.value = parsedLyrics;
+        data._lyricsBody = parsedLyrics.map(([time, text]) => [Math.max(0, time + offset), text]);
+        data._editBody = parsedLyrics.map(([, text]) => text).join("\n");
       }
-      const offset = startTimeMs - parsedLyrics[0][0];
-      originalParsedLyrics.value = parsedLyrics;
-      editLyricsData.value!.data!._lyricsBody = parsedLyrics.map(([time, text]) => [
-        Math.max(0, time + offset),
-        text,
-      ]);
-      editLyricsData.value!.data!._editBody = parsedLyrics.map(([, text]) => text).join("\n");
     }
   }
 
@@ -1057,6 +1182,7 @@ function editLyrics(item: SubTitle) {
     lyricsStartTime.value = "";
     lyricsStartTimeError.value = false;
     useOnlineLyrics.value = false;
+    timelineDirty.value = false;
     lyricsType.value = fromData.useEnhancedLyrics ? "enhanced" : "normal";
     // 将 ♪ 复选框默认设为勾选（预览时显示 ♪）
     lyricsBodySwitch.note = false;
@@ -1134,214 +1260,325 @@ function openWorkshop(item?: SubTitle) {
 
 <template>
   <div>
-  <UiSpin :loading="!fromData.playerData && !error">
-    <form @submit.prevent>
-      <div class="lyrics-workshop-container" v-if="fromData.playerData">
-        <div class="lyrics-workshop-header">
-          <UiButton type="primary" @click="openWorkshop()">
-            <template #icon>
-              <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
-                <path
-                  d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
-                />
-              </svg>
+    <UiSpin :loading="!fromData.playerData && !error">
+      <form @submit.prevent>
+        <div class="lyrics-workshop-container" v-if="fromData.playerData">
+          <div class="lyrics-workshop-header">
+            <UiButton type="primary" @click="openWorkshop()">
+              <template #icon>
+                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+                  <path
+                    d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+                  />
+                </svg>
+              </template>
+              歌词工作台
+            </UiButton>
+          </div>
+          <UiResult
+            v-if="error"
+            status="error"
+            :title="error"
+            subtitle="请查看视频是否有字幕,包括AI字幕,如果没有,请跳过"
+          >
+            <template #extra>
+              <div style="display: flex; gap: 8px">
+                <UiButton type="primary" @click="skipLyrics">跳过字幕嵌入</UiButton>
+              </div>
             </template>
-            歌词工作台
-          </UiButton>
-        </div>
-        <UiResult
-          v-if="error"
-          status="error"
-          :title="error"
-          subtitle="请查看视频是否有字幕,包括AI字幕,如果没有,请跳过"
-        >
-          <template #extra>
-            <div style="display: flex; gap: 8px">
-              <UiButton type="primary" @click="skipLyrics">跳过字幕嵌入</UiButton>
-            </div>
-          </template>
-        </UiResult>
-        <div class="lyrics-list-scroll" v-else>
-          <div class="lyrics-list">
-            <div v-for="item in subtitles" :key="item.id">
-              <div
-                class="lyrics-card"
-                :class="{ 'lyrics-card-checked': subtitle.includes(item.id_str) }"
-                @click="toggleSubtitle(item.id_str)"
-              >
-                <div class="lyrics-card-checkbox">
-                  <div class="lyrics-card-checkbox-dot" v-if="subtitle.includes(item.id_str)" />
-                </div>
-                <div class="lyrics-card-content">
-                  <div class="lyrics-card-header">
-                    <span class="lyrics-card-title">{{ item.lan_doc }}</span>
+          </UiResult>
+          <div class="lyrics-list-scroll" v-else>
+            <div class="lyrics-list">
+              <div v-for="item in subtitles" :key="item.id">
+                <div
+                  class="lyrics-card"
+                  :class="{ 'lyrics-card-checked': subtitle.includes(item.id_str) }"
+                  @click="toggleSubtitle(item.id_str)"
+                >
+                  <div class="lyrics-card-checkbox">
+                    <div class="lyrics-card-checkbox-dot" v-if="subtitle.includes(item.id_str)" />
                   </div>
+                  <div class="lyrics-card-content">
+                    <div class="lyrics-card-header">
+                      <span class="lyrics-card-title">{{ item.lan_doc }}</span>
+                    </div>
 
-                  <div v-if="item.data" class="lyrics-card-preview">
-                    {{
-                      subtitleEdit &&
-                      subtitleEdit.data &&
-                      item.id_str === subtitleEdit.id_str &&
-                      lyricsBodyContent
-                        ? lyricsBodyContent
-                        : item.data.body.map((item) => item.content).join("\n")
-                    }}
+                    <div v-if="item.data" class="lyrics-card-preview">
+                      {{
+                        subtitleEdit &&
+                        subtitleEdit.data &&
+                        item.id_str === subtitleEdit.id_str &&
+                        lyricsBodyContent
+                          ? lyricsBodyContent
+                          : item.data.body.map((item) => item.content).join("\n")
+                      }}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
-      <UiCheckbox v-model="fromData.externalLyrics" style="margin-top: 8px">
-        外置歌词（保存为独立 .lrc 文件，不嵌入音频）
-      </UiCheckbox>
-      <UiAlert type="warning" style="margin-top: 8px; margin-left: 12px; margin-right: 12px">
-        ⚠️ 歌词工作台内的操作（如在线歌词、智能纠错、AI
-        改写等）无法被保存至默认规则。批量下载时请使用手工下载模式。
-      </UiAlert>
-      <Btn @next="next" @prev="$emit('prev')" />
-    </form>
-  </UiSpin>
-  <UiModal v-model:visible="visible" title="歌词工作台" fullscreen>
-    <template #footer>
-      <UiButton @click="handleCancel"> 取消 </UiButton>
-      <UiButton
-        type="primary"
-        :disabled="!useOnlineLyrics && lyricsBodyLine[0] !== lyricsBodyLine[1]"
-        @click="handleOk"
-      >
-        确定
-      </UiButton>
-    </template>
-    <div v-if="editLyricsData && editLyricsData.data" class="lyrics-workspace">
-      <div class="lyrics-left-panel">
-        <UiTextarea
-          class="lyrics-left-textarea"
-          v-model="editLyricsData.data._editBody"
-          :rows="20"
-          @paste="handleLeftPanelPaste"
-        />
-        <div class="lyrics-left-footer">
-          <span>格式化：</span>
-          <UiCheckbox v-model="lyricsBodySwitch.note"> ♪ </UiCheckbox>
+        <UiCheckbox v-model="fromData.externalLyrics" style="margin-top: 8px">
+          外置歌词（保存为独立 .lrc 文件，不嵌入音频）
+        </UiCheckbox>
+        <UiAlert type="warning" style="margin-top: 8px; margin-left: 12px; margin-right: 12px">
+          ⚠️ 歌词工作台内的操作（如在线歌词、智能纠错、AI
+          改写等）无法被保存至默认规则。批量下载时请使用手工下载模式。
+        </UiAlert>
+        <Btn @next="next" @prev="$emit('prev')" />
+      </form>
+    </UiSpin>
+    <UiModal v-model:visible="visible" title="歌词工作台" fullscreen>
+      <template #footer>
+        <UiButton @click="handleCancel"> 取消 </UiButton>
+        <UiButton
+          type="primary"
+          :disabled="!useOnlineLyrics && lyricsBodyLine[0] !== lyricsBodyLine[1]"
+          @click="handleOk"
+        >
+          确定
+        </UiButton>
+      </template>
+      <div v-if="editLyricsData && editLyricsData.data" class="lyrics-workspace">
+        <!-- 时间轴 tab 下收起左面板让右列全宽；必须用 v-show 以保留 textarea 的 undo 栈 -->
+        <div v-show="activeTab !== '4' || showTimelineText" class="lyrics-left-panel">
+          <UiTextarea
+            class="lyrics-left-textarea"
+            v-model="editLyricsData.data._editBody"
+            :rows="20"
+            @paste="handleLeftPanelPaste"
+          />
+          <div class="lyrics-left-footer">
+            <span>格式化：</span>
+            <UiCheckbox v-model="lyricsBodySwitch.note"> ♪ </UiCheckbox>
+          </div>
         </div>
-      </div>
-      <UiTabs
-        class="lyrics-right-panel"
-        :active-key="activeTab"
-        @change="activeTab = $event"
-        :tabs="[
-          { key: '1', title: '在线歌词' },
-          { key: '2', title: 'AI 改写' },
-          { key: '3', title: '结果预览' },
-        ]"
-      >
-        <div v-if="activeTab === '1'">
-          <UiSpin
-            style="height: 100%; display: flex; flex-direction: column"
-            :loading="onlineLyricsLoading || onlineLyricsLoading2"
-            tip="正在搜索在线歌词"
-          >
-            <div style="display: flex; gap: 8px; flex-wrap: wrap">
-              <UiInput :style="{ width: '160px' }" placeholder="歌名" v-model="onlineSearch" />
-              <UiButton @click="searchOnlineLyrics">
-                <template #icon>
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    width="16"
-                    height="16"
-                  >
-                    <circle cx="11" cy="11" r="8" />
-                    <path d="M21 21l-4.35-4.35" />
-                  </svg>
-                </template>
-              </UiButton>
-              <UiSelect
-                :options="onlineLyricsOptions.flatMap((group) => group.options)"
-                :style="{ width: '160px' }"
-                placeholder="在线歌词"
-                v-model="onlineLyricsIndex"
-              />
-              <UiCheckbox v-model="lyricsBodySwitch.timeAxis">时间轴</UiCheckbox>
-              <UiCheckbox v-model="lyricsBodySwitch.blankChar">空白字符</UiCheckbox>
-              <UiCheckbox v-model="lyricsBodySwitch.metaInfo">元信息</UiCheckbox>
-              <UiCheckbox v-model="lyricsBodySwitch.stripMeta"
-                >智能保留歌词正文（保留时间轴）</UiCheckbox
-              >
-            </div>
-            <div style="margin: 10px 0; display: flex; align-items: center; gap: 10px">
-              <UiButton
-                :type="useOnlineLyrics ? 'primary' : 'outline'"
-                :disabled="!onlineLyrics"
-                @click="toggleUseOnlineLyrics"
-              >
-                {{ useOnlineLyrics ? "✓ 已使用在线歌词" : "使用在线歌词" }}
-              </UiButton>
-              <span>开始时间：</span>
-              <UiInput
-                v-model="lyricsStartTime"
-                style="width: 100px"
-                placeholder="mm:ss"
-                :error="lyricsStartTimeError"
-                :disabled="!useOnlineLyrics"
-                @change="onLyricsStartTimeChange"
-              />
-              <UiButton :disabled="lyricsMode === 'ai'" @click="undoReplaceLyrics">
-                ↩ 撤销
-              </UiButton>
-            </div>
-            <UiAlert type="info" style="margin-bottom: 10px">
-              💡
-              使用在线歌词：勾选后会自动替换歌词并使用在线歌词的时间轴。需要设置开始时间（即在线歌词中第一行在视频中出现的时间），为了方便对齐，可以勾选「智能保留歌词正文（保留时间轴）」快速删除在线歌词中的非正文部分（如标题，歌手）。若提示无时间轴，应当勾选「时间轴」选项。
-            </UiAlert>
-            <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px">
-              <UiButton
-                :type="lyricsMode === 'ai-corrected' ? 'primary' : 'outline'"
-                :disabled="!onlineLyrics || useOnlineLyrics"
-                @click="smartCorrectLyrics"
-              >
-                {{ lyricsMode === "ai-corrected" ? "✓ 已纠错" : "智能纠错" }}
-              </UiButton>
-              <UiCheckbox v-model="lyricsBodySwitch.stripMetaPlain"
-                >智能保留歌词正文（纯文本）</UiCheckbox
-              >
-            </div>
-            <UiAlert type="info" style="margin-bottom: 10px">
-              💡
-              智能纠错：勾选后会保留AI的时间轴，使用在线歌词与AI歌词进行差异比对和自动纠错，智能纠错需要删除所有在线歌词的非歌词正文部分，为了方便可以勾选「智能保留歌词正文（纯文本）」快速删除在线歌词中的非正文部分（如标题，歌手）。
-            </UiAlert>
-            <div style="flex: 1; overflow: auto; display: flex; flex-direction: column">
-              <div style="display: flex; gap: 8px; margin-bottom: 10px">
+        <UiTabs
+          class="lyrics-right-panel"
+          :active-key="activeTab"
+          @change="activeTab = $event"
+          :tabs="[
+            { key: '1', title: '在线歌词' },
+            { key: '2', title: 'AI 改写' },
+            { key: '3', title: '结果预览' },
+            { key: '4', title: '时间轴' },
+          ]"
+        >
+          <div v-if="activeTab === '1'">
+            <UiSpin
+              style="height: 100%; display: flex; flex-direction: column"
+              :loading="onlineLyricsLoading || onlineLyricsLoading2"
+              tip="正在搜索在线歌词"
+            >
+              <div style="display: flex; gap: 8px; flex-wrap: wrap">
+                <UiInput :style="{ width: '160px' }" placeholder="歌名" v-model="onlineSearch" />
+                <UiButton @click="searchOnlineLyrics">
+                  <template #icon>
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      width="16"
+                      height="16"
+                    >
+                      <circle cx="11" cy="11" r="8" />
+                      <path d="M21 21l-4.35-4.35" />
+                    </svg>
+                  </template>
+                </UiButton>
                 <UiSelect
-                  v-model="lyricsBodySwitch.onlineDiff"
+                  :options="onlineLyricsOptions.flatMap((group) => group.options)"
+                  :style="{ width: '160px' }"
+                  placeholder="在线歌词"
+                  v-model="onlineLyricsIndex"
+                />
+                <UiCheckbox v-model="lyricsBodySwitch.timeAxis">时间轴</UiCheckbox>
+                <UiCheckbox v-model="lyricsBodySwitch.blankChar">空白字符</UiCheckbox>
+                <UiCheckbox v-model="lyricsBodySwitch.metaInfo">元信息</UiCheckbox>
+                <UiCheckbox v-model="lyricsBodySwitch.stripMeta"
+                  >智能保留歌词正文（保留时间轴）</UiCheckbox
+                >
+              </div>
+              <div style="margin: 10px 0; display: flex; align-items: center; gap: 10px">
+                <UiButton
+                  :type="useOnlineLyrics ? 'primary' : 'outline'"
+                  :disabled="!onlineLyrics"
+                  @click="toggleUseOnlineLyrics"
+                >
+                  {{ useOnlineLyrics ? "✓ 已使用在线歌词" : "使用在线歌词" }}
+                </UiButton>
+                <span>开始时间：</span>
+                <UiInput
+                  v-model="lyricsStartTime"
+                  style="width: 100px"
+                  placeholder="mm:ss"
+                  :error="lyricsStartTimeError"
+                  :disabled="!useOnlineLyrics"
+                  @change="onLyricsStartTimeChange"
+                />
+                <UiButton :disabled="lyricsMode === 'ai'" @click="undoReplaceLyrics">
+                  ↩ 撤销
+                </UiButton>
+              </div>
+              <UiAlert type="info" style="margin-bottom: 10px">
+                💡
+                使用在线歌词：勾选后会自动替换歌词并使用在线歌词的时间轴。需要设置开始时间（即在线歌词中第一行在视频中出现的时间），为了方便对齐，可以勾选「智能保留歌词正文（保留时间轴）」快速删除在线歌词中的非正文部分（如标题，歌手）。若提示无时间轴，应当勾选「时间轴」选项。
+              </UiAlert>
+              <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px">
+                <UiButton
+                  :type="lyricsMode === 'ai-corrected' ? 'primary' : 'outline'"
+                  :disabled="!onlineLyrics || useOnlineLyrics"
+                  @click="smartCorrectLyrics"
+                >
+                  {{ lyricsMode === "ai-corrected" ? "✓ 已纠错" : "智能纠错" }}
+                </UiButton>
+                <UiCheckbox v-model="lyricsBodySwitch.stripMetaPlain"
+                  >智能保留歌词正文（纯文本）</UiCheckbox
+                >
+              </div>
+              <UiAlert type="info" style="margin-bottom: 10px">
+                💡
+                智能纠错：勾选后会保留AI的时间轴，使用在线歌词与AI歌词进行差异比对和自动纠错，智能纠错需要删除所有在线歌词的非歌词正文部分，为了方便可以勾选「智能保留歌词正文（纯文本）」快速删除在线歌词中的非正文部分（如标题，歌手）。
+              </UiAlert>
+              <div style="flex: 1; overflow: auto; display: flex; flex-direction: column">
+                <div style="display: flex; gap: 8px; margin-bottom: 10px">
+                  <UiSelect
+                    v-model="lyricsBodySwitch.onlineDiff"
+                    :options="
+                      Object.entries(diffFunc).map(([key, [label]]) => ({ label, value: key }))
+                    "
+                    style="width: 140px"
+                  />
+                  <UiButton
+                    @click="
+                      onlineLyricsViewMode = onlineLyricsViewMode === 'edit' ? 'diff' : 'edit'
+                    "
+                  >
+                    {{ onlineLyricsViewMode === "edit" ? "查看差异" : "编辑歌词" }}
+                  </UiButton>
+                  <UiSelect
+                    v-model="lyricsType"
+                    placeholder="歌词类型"
+                    :options="[
+                      { label: '普通歌词', value: 'normal' },
+                      { label: '逐字歌词', value: 'enhanced' },
+                    ]"
+                    style="width: 110px"
+                  />
+                </div>
+
+                <div v-if="onlineLyricsViewMode === 'diff'" class="diff-container-textarea">
+                  <span
+                    v-for="(part, index) in onlineLyricsDiff"
+                    :key="index"
+                    :class="{
+                      'diff-added': part.added,
+                      'diff-removed': part.removed,
+                    }"
+                    >{{ part.value }}</span
+                  >
+                </div>
+                <UiTextarea
+                  v-else
+                  class="online-lyrics-editor"
+                  v-model="editableOnlineLyrics"
+                  :rows="15"
+                  placeholder="在线歌词（可编辑，修改后用于智能纠错）"
+                />
+              </div>
+            </UiSpin>
+          </div>
+          <div v-if="activeTab === '2'" style="display: flex; flex-direction: column">
+            <div style="display: flex; flex-direction: column; gap: 8px">
+              <UiAlert type="info">将网络歌词给AI进行纠正（此部分未进行维护，可用性未知）</UiAlert>
+
+              <UiButton type="primary" @click="aiRewrite">AI 改写</UiButton>
+              <div style="position: relative">
+                <UiButton type="primary" @click="showOpenAISettings = !showOpenAISettings">
+                  <template #icon>
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+                      <path
+                        d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.25.41.48.41h3.84c.24 0 .44-.17.47-.41l.36 2.54c.59.24 1.13.56 1.62.94l2.39.96c.22.08.47 0 .59-.22l2.74-1.88c.12-.21.08-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+                      />
+                    </svg>
+                  </template>
+                </UiButton>
+                <div
+                  v-if="showOpenAISettings"
+                  style="
+                    position: absolute;
+                    left: 0;
+                    top: 100%;
+                    margin-top: 4px;
+                    padding: 10px;
+                    width: 200px;
+                    background-color: var(--color-bg-popup);
+                    border-radius: 4px;
+                    box-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.15);
+                    z-index: 1000;
+                  "
+                >
+                  <UiInput
+                    placeholder="Host"
+                    v-model="userConfig.openai.host"
+                    style="margin-bottom: 8px"
+                  />
+                  <UiInput
+                    placeholder="Key"
+                    v-model="userConfig.openai.key"
+                    style="margin-bottom: 8px"
+                  />
+                  <UiInput placeholder="Modal" v-model="userConfig.openai.modal" />
+                </div>
+              </div>
+            </div>
+            <UiSpin
+              style="margin-top: 10px; flex: 1; overflow: auto; width: 100%"
+              :loading="aiRewriteLoading"
+            >
+              <details
+                style="
+                  margin-bottom: 10px;
+                  border: 1px solid #e3e5e7;
+                  border-radius: 6px;
+                  padding: 8px;
+                "
+              >
+                <summary style="cursor: pointer; font-weight: 500; margin-bottom: 10px">
+                  自定义 Prompt
+                </summary>
+                <div style="display: flex; gap: 8px; margin-bottom: 10px">
+                  <UiButton type="primary" @click="aiRewritePrompt += ' {{onlineLyrics}}'">
+                    在线歌词
+                  </UiButton>
+
+                  <UiButton
+                    type="primary"
+                    @click="aiRewritePrompt += ' {{danmu}}'"
+                    :disabled="true"
+                  >
+                    添加弹幕
+                  </UiButton>
+                </div>
+                <UiTextarea v-model="aiRewritePrompt" :rows="4" />
+              </details>
+              <div style="margin-bottom: 10px">
+                <UiSelect
+                  v-model="lyricsBodySwitch.aiDiff"
                   :options="
                     Object.entries(diffFunc).map(([key, [label]]) => ({ label, value: key }))
                   "
-                  style="width: 140px"
                 />
-                <UiButton
-                  @click="onlineLyricsViewMode = onlineLyricsViewMode === 'edit' ? 'diff' : 'edit'"
-                >
-                  {{ onlineLyricsViewMode === "edit" ? "查看差异" : "编辑歌词" }}
-                </UiButton>
-                <UiSelect
-                  v-model="lyricsType"
-                  placeholder="歌词类型"
-                  :options="[
-                    { label: '普通歌词', value: 'normal' },
-                    { label: '逐字歌词', value: 'enhanced' },
-                  ]"
-                  style="width: 110px"
-                />
+                <UiAlert :type="lyricsBodyLine[0] === lyricsBodyLine[2] ? 'success' : 'error'"
+                  ><span style="margin-right: 20px">原行数：{{ lyricsBodyLine[0] }}</span
+                  ><span>AI行数：{{ lyricsBodyLine[2] }}</span>
+                </UiAlert>
               </div>
-
-              <div v-if="onlineLyricsViewMode === 'diff'" class="diff-container-textarea">
+              <div class="diff-container-textarea">
                 <span
-                  v-for="(part, index) in onlineLyricsDiff"
+                  v-for="(part, index) in aiLyricsDiff"
                   :key="index"
                   :class="{
                     'diff-added': part.added,
@@ -1350,109 +1587,27 @@ function openWorkshop(item?: SubTitle) {
                   >{{ part.value }}</span
                 >
               </div>
-              <UiTextarea
-                v-else
-                class="online-lyrics-editor"
-                v-model="editableOnlineLyrics"
-                :rows="15"
-                placeholder="在线歌词（可编辑，修改后用于智能纠错）"
-              />
-            </div>
-          </UiSpin>
-        </div>
-        <div v-if="activeTab === '2'" style="display: flex; flex-direction: column">
-          <div style="display: flex; flex-direction: column; gap: 8px">
-            <UiAlert type="info">将网络歌词给AI进行纠正（此部分未进行维护，可用性未知）</UiAlert>
-
-            <UiButton type="primary" @click="aiRewrite">AI 改写</UiButton>
-            <div style="position: relative">
-              <UiButton type="primary" @click="showOpenAISettings = !showOpenAISettings">
-                <template #icon> <icon-settings /> </template>
-              </UiButton>
-              <div
-                v-if="showOpenAISettings"
-                style="
-                  position: absolute;
-                  left: 0;
-                  top: 100%;
-                  margin-top: 4px;
-                  padding: 10px;
-                  width: 200px;
-                  background-color: var(--color-bg-popup);
-                  border-radius: 4px;
-                  box-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.15);
-                  z-index: 1000;
-                "
-              >
-                <UiInput
-                  placeholder="Host"
-                  v-model="userConfig.openai.host"
-                  style="margin-bottom: 8px"
-                />
-                <UiInput
-                  placeholder="Key"
-                  v-model="userConfig.openai.key"
-                  style="margin-bottom: 8px"
-                />
-                <UiInput placeholder="Modal" v-model="userConfig.openai.modal" />
-              </div>
-            </div>
+            </UiSpin>
           </div>
-          <UiSpin
-            style="margin-top: 10px; flex: 1; overflow: auto; width: 100%"
-            :loading="aiRewriteLoading"
-          >
-            <details
-              style="
-                margin-bottom: 10px;
-                border: 1px solid #e3e5e7;
-                border-radius: 6px;
-                padding: 8px;
-              "
-            >
-              <summary style="cursor: pointer; font-weight: 500; margin-bottom: 10px">
-                自定义 Prompt
-              </summary>
-              <div style="display: flex; gap: 8px; margin-bottom: 10px">
-                <UiButton type="primary" @click="aiRewritePrompt += ' {{onlineLyrics}}'">
-                  在线歌词
-                </UiButton>
-
-                <UiButton type="primary" @click="aiRewritePrompt += ' {{danmu}}'" :disabled="true">
-                  添加弹幕
-                </UiButton>
-              </div>
-              <UiTextarea v-model="aiRewritePrompt" :rows="4" />
-            </details>
-            <div style="margin-bottom: 10px">
-              <UiSelect
-                v-model="lyricsBodySwitch.aiDiff"
-                :options="Object.entries(diffFunc).map(([key, [label]]) => ({ label, value: key }))"
-              />
-              <UiAlert :type="lyricsBodyLine[0] === lyricsBodyLine[2] ? 'success' : 'error'"
-                ><span style="margin-right: 20px">原行数：{{ lyricsBodyLine[0] }}</span
-                ><span>AI行数：{{ lyricsBodyLine[2] }}</span>
-              </UiAlert>
+          <div v-if="activeTab === '3'">
+            <UiTextarea class="result-preview-editor" :model-value="lyricsBodyContent" :rows="25" />
+          </div>
+          <div v-if="activeTab === '4'">
+            <div style="display: flex; justify-content: flex-end; margin-bottom: 8px">
+              <UiButton size="small" type="outline" @click="showTimelineText = !showTimelineText">
+                {{ showTimelineText ? "隐藏文本面板" : "显示文本面板" }}
+              </UiButton>
             </div>
-            <div class="diff-container-textarea">
-              <span
-                v-for="(part, index) in aiLyricsDiff"
-                :key="index"
-                :class="{
-                  'diff-added': part.added,
-                  'diff-removed': part.removed,
-                }"
-                >{{ part.value }}</span
-              >
-            </div>
-          </UiSpin>
-        </div>
-        <div v-if="activeTab === '3'">
-          <UiTextarea class="result-preview-editor" :model-value="lyricsBodyContent" :rows="25" />
-        </div>
-      </UiTabs>
-    </div>
-  </UiModal>
+            <LyricsTimeline
+              :lines="timelineLines"
+              :enhanced="fromData.useEnhancedLyrics"
+              :clip-ranges="fromData.clipRanges"
+              @commit="onTimelineCommit"
+            />
+          </div>
+        </UiTabs>
+      </div>
+    </UiModal>
   </div>
 </template>
 
@@ -1695,11 +1850,7 @@ body[arco-theme="dark"] .lyrics-preview-text {
   overflow: visible !important;
 }
 
-/* 在线歌词编辑框和 diff 容器 */
-.online-lyrics-editor :deep(.ui-textarea) {
-  min-height: 300px;
-}
-
+/* diff 容器 */
 .diff-container-textarea {
   min-height: 300px;
   max-height: 500px;
