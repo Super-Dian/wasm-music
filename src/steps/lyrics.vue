@@ -346,6 +346,13 @@ function onLyricsStartTimeChange(value: string | Event) {
   lyricsStartTimeError.value = false;
 
   if (lyricsMode.value !== "online") return;
+  // 溢出检查：首行时间不得移出歌曲结束
+  const durMs = getHostDurationMs();
+  if (durMs > 0 && startTimeMs > durMs) {
+    lyricsStartTimeError.value = true;
+    Message.error("开始时间超出歌曲时长");
+    return;
+  }
   applyGlobalStartTimeDelta(startTimeMs);
 }
 
@@ -420,6 +427,12 @@ function applyGlobalStartTimeDelta(startTimeMs: number): boolean {
   return true;
 }
 
+/** 宿主歌曲时长（ms）；取不到时返回 0，调用方据此跳过上界检查 */
+function getHostDurationMs(): number {
+  const video = document.querySelector<HTMLVideoElement>(".bpx-player-video-wrap video");
+  return video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration * 1000 : 0;
+}
+
 /**
  * 物化当前模式下的时间轴行（与 next() 的三模式取数逻辑同构）。
  * online → _lyricsBody（空时兜底解析右侧编辑框）；
@@ -469,6 +482,31 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
   lyricsStartTime.value = formatStartTimeMs(normalized[0][0]);
   lyricsStartTimeError.value = false;
   if (globalDelta) shiftEnhancedLrc(globalDelta);
+}
+
+const leftTextareaRef = ref<InstanceType<typeof UiTextarea> | null>(null);
+
+/**
+ * 时间轴选中行 → 左侧文本面板同步跳转到对应行。
+ * 面板未打开（v-show display:none）时直接跳过同步逻辑。
+ */
+function onTimelineSelect(index: number) {
+  const root = leftTextareaRef.value?.$el as HTMLElement | undefined;
+  const ta = root?.querySelector("textarea");
+  if (!ta || ta.offsetParent === null) return;
+  const text = ta.value;
+  // 定位第 index 行的字符起点：跳过 index 个换行符（行数不足时停在最后一行）
+  let pos = 0;
+  for (let line = 0; line < index && pos < text.length; line++) {
+    const nl = text.indexOf("\n", pos);
+    if (nl === -1) break;
+    pos = nl + 1;
+  }
+  let end = text.indexOf("\n", pos);
+  if (end === -1) end = text.length;
+  // 选中整行：浏览器把选区滚入可视区（textarea 软换行场景由浏览器计算，不会算错行）
+  ta.focus();
+  ta.setSelectionRange(pos, end);
 }
 
 const diffFunc = {
@@ -961,6 +999,14 @@ function handleOk() {
       return;
     }
 
+    // 溢出检查：与开始时间输入同一规则，首行时间不得移出歌曲结束
+    const durMs = getHostDurationMs();
+    if (durMs > 0 && startTimeMs > durMs) {
+      Message.error("开始时间超出歌曲时长");
+      lyricsStartTimeError.value = true;
+      return;
+    }
+
     const data = editLyricsData.value!.data!;
 
     if (fromData.useEnhancedLyrics && onlineYrc.value) {
@@ -1344,6 +1390,7 @@ function openWorkshop(item?: SubTitle) {
         <!-- 时间轴 tab 下收起左面板让右列全宽；必须用 v-show 以保留 textarea 的 undo 栈 -->
         <div v-show="activeTab !== '4' || showTimelineText" class="lyrics-left-panel">
           <UiTextarea
+            ref="leftTextareaRef"
             class="lyrics-left-textarea"
             v-model="editLyricsData.data._editBody"
             :rows="20"
@@ -1603,6 +1650,7 @@ function openWorkshop(item?: SubTitle) {
               :enhanced="fromData.useEnhancedLyrics"
               :clip-ranges="fromData.clipRanges"
               @commit="onTimelineCommit"
+              @select="onTimelineSelect"
             />
           </div>
         </UiTabs>

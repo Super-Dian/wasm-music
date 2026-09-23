@@ -23,6 +23,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   (e: "commit", lines: Lyrics, globalDelta?: number): void;
+  (e: "select", index: number): void;
 }>();
 
 /** 宿主 B 站播放器 video（与 clip.vue 同源选择器） */
@@ -380,6 +381,8 @@ function onDocMouseUp(e: MouseEvent) {
       seekTo(drag.startMs);
     }
     selectedId.value = i;
+    // 选中行变化 → 通知父级同步左侧文本面板（点击与拖拽松手均触发一次）
+    emit("select", i);
     drag.active = false;
     drag.blockEl = null;
     drag.timeEl = null;
@@ -461,14 +464,28 @@ function applyShiftAll() {
     Message.warning("请输入偏移秒数，如 0.5 或 -0.3");
     return;
   }
-  if (!workingLines.value.length) return;
-  const deltaMs = Math.round(sec * 1000);
-  workingLines.value = workingLines.value.map(([t, s]): [number, string] => [
-    Math.max(0, t + deltaMs),
-    s,
-  ]);
+  const lines = workingLines.value;
+  if (!lines.length) return;
+
+  // 溢出检查：整体平移必须让整表留在 [0, 歌曲结束] 内。
+  // 钳制的是「统一 delta」而不是逐行 Math.max——逐行钳制会让出界行堆叠在 0、破坏行距。
+  const requested = Math.round(sec * 1000);
+  const minDelta = -lines[0][0]; // 首句最早对齐 00:00（表有序 → 全表 ≥0）
+  const maxDelta =
+    durationMs.value > 0 ? durationMs.value - lines[lines.length - 1][0] : Number.MAX_SAFE_INTEGER;
+  const deltaMs = Math.min(Math.max(requested, minDelta), maxDelta);
+
+  if (deltaMs !== requested) {
+    if (deltaMs === 0) {
+      Message.warning("已到达歌曲边界，无法继续偏移");
+      return;
+    }
+    Message.info(`偏移超出歌曲范围，已调整为 ${(deltaMs / 1000).toFixed(3)} 秒`);
+  }
+
+  workingLines.value = lines.map(([t, s]): [number, string] => [t + deltaMs, s]);
   shiftInput.value = "";
-  // 整体平移：携带 globalDelta 供父级同步逐字歌词
+  // 携带「实际应用」的 delta（可能已被钳制）供父级同步逐字歌词
   emitCommit(deltaMs);
 }
 
