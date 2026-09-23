@@ -131,7 +131,9 @@ const visibleRows = computed(() => {
           ? durationMs.value
           : start + 5000;
     if (end < v0 || start > v1) continue;
-    const width = Math.max(8, ((end - start) / 1000) * pps);
+    // 不设最小宽度：强行撑到 8px 会在两句同刻（拖到夹紧边界）时压在下一句上造成重合。
+    // 等时/极近的行渲染为细线标记（选中态 outline 仍可见），数据层等时间戳是合法的。
+    const width = Math.max(0, ((end - start) / 1000) * pps);
     rows.push({
       i,
       left: (start / 1000) * pps,
@@ -198,7 +200,11 @@ function syncPlayheadDom() {
 }
 
 function writeStatusTime() {
-  if (timeEl.value) timeEl.value.textContent = formatMsFull(displayTimeMs);
+  const el = timeEl.value;
+  if (!el) return;
+  // 逐帧调用：内容未变时不写 DOM，避免无谓的行内布局失效
+  const text = formatMsFull(displayTimeMs);
+  if (el.textContent !== text) el.textContent = text;
 }
 
 /** 二分查找当前时间所在行（workingLines 按时间升序，邻接夹紧保证） */
@@ -576,7 +582,7 @@ onUnmounted(() => {
       >
         {{ w }}s
       </UiButton>
-      <UiCheckbox v-model="followPlayhead">跟随播放头</UiCheckbox>
+      <UiCheckbox v-model="followPlayhead">跟随播放指针</UiCheckbox>
       <span class="lt-divider"></span>
       <span class="lt-label">整体偏移(秒)</span>
       <UiInput
@@ -586,8 +592,13 @@ onUnmounted(() => {
         @keyup.enter="applyShiftAll"
       />
       <UiButton size="small" @click="applyShiftAll">应用</UiButton>
-      <UiButton size="small" :disabled="selectedId === null" @click="alignSelectedToPlayhead">
-        对齐到播放头
+      <UiButton
+        size="small"
+        :disabled="selectedId === null"
+        title="将选中行的开始时间设为播放指针当前所在的时间点"
+        @click="alignSelectedToPlayhead"
+      >
+        对齐到播放指针
       </UiButton>
       <UiButton size="small" :disabled="selectedId === null" @click="nudgeSelected(-100)">
         −100ms
@@ -742,7 +753,11 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 0 8px;
+  /* 块本体不带 padding：border-box 下指定宽度小于 padding+border 时，
+     浏览器会把实际占位撑到 padding+border（约 18px），且 overflow 裁剪边界
+     是 padding box——近零时长的块会连底色带漏出的文字一起压进下一句。
+     左右内边距改由子元素承担（time 的 margin-left / text 的 padding-right），
+     块本体因此可真正收缩到仅剩 1px 边框。 */
   background: rgba(0, 174, 236, 0.12);
   border: 1px solid rgba(0, 174, 236, 0.45);
   border-radius: 4px;
@@ -773,6 +788,8 @@ onUnmounted(() => {
 
 .lt-block-time {
   flex: none;
+  /* 替代块本体的左内边距；子元素 margin 不参与父块占位计算 */
+  margin-left: 8px;
   font-size: 10px;
   opacity: 0.75;
   font-variant-numeric: tabular-nums;
@@ -781,6 +798,8 @@ onUnmounted(() => {
 .lt-block-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  /* 替代块本体的右内边距，收在自身盒内不影响父块占位 */
+  padding-right: 8px;
 }
 
 .lt-clip-mask {
@@ -819,6 +838,10 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   color: var(--color-bili-blue, #00aeec);
   font-weight: 600;
+  /* 固定时间槽宽：逐帧变化的数字若宽度不一，会推挤右侧歌词详情造成反复抽搐 */
+  min-width: 9ch;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .lt-status-sel {
