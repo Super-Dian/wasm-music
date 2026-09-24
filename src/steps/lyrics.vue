@@ -283,6 +283,8 @@ const timelineDirty = ref(false);
 const timelineBaseline = ref<Lyrics | null>(null);
 /** 与 timelineBaseline 同刻的 enhancedLrc 快照（null 表示当时未记录） */
 const timelineBaselineEnhanced = ref<string | null>(null);
+/** 与 timelineBaseline 同刻的左面板文本快照（撤销时连同 _editBody 一并恢复） */
+const timelineBaselineEditBody = ref<string | null>(null);
 
 /**
  * 切换使用在线歌词状态
@@ -439,6 +441,7 @@ function applyGlobalStartTimeDelta(startTimeMs: number): boolean {
   if (!timelineDirty.value) {
     timelineBaseline.value = data._lyricsBody.map(([t, s]): [number, string] => [t, s]);
     timelineBaselineEnhanced.value = fromData.enhancedLrc;
+    timelineBaselineEditBody.value = data._editBody ?? "";
   }
   data._lyricsBody = data._lyricsBody.map(([t, s]) => [Math.max(0, t + delta), s]);
   shiftEnhancedLrc(delta);
@@ -495,6 +498,7 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
   if (!timelineDirty.value) {
     timelineBaseline.value = getTimelineLines().map(([t, s]): [number, string] => [t, s]);
     timelineBaselineEnhanced.value = fromData.enhancedLrc;
+    timelineBaselineEditBody.value = data._editBody ?? "";
   }
   const normalized: Lyrics = next.map(([ms, t]) => [Math.max(0, Math.round(ms)), t]);
   data._lyricsBody = normalized;
@@ -509,15 +513,21 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
 }
 
 /**
- * 撤销所有时间轴编辑：恢复到首次编辑前的原始时间轴快照。
- * 会同步恢复 enhancedLrc、清 dirty、把「开始时间」输入重指到基线首行；
- * ai 模式曾被提升为 ai-corrected 但基线内容与原 AI zip 等价，无需回退模式。
+ * 撤销所有时间轴编辑：恢复到首次编辑前的原始快照。
+ * 会同步恢复左面板文本（_editBody）、enhancedLrc、清 dirty、把「开始时间」
+ * 输入重指到基线首行；ai 模式曾被提升为 ai-corrected 但基线内容与原 AI zip
+ * 等价，无需回退模式。
  */
 function resetTimelineEdits() {
   const data = editLyricsData.value?.data;
   if (!timelineDirty.value || !timelineBaseline.value || !data) return;
   const restored: Lyrics = timelineBaseline.value.map(([t, s]): [number, string] => [t, s]);
   data._lyricsBody = restored;
+  // 连带恢复左面板文本：否则左面板停留在编辑后状态，且下一次按键会经
+  // _editBody→_lyricsBody 同步 watcher 把旧文本写回、冲掉刚恢复的时间轴表
+  if (timelineBaselineEditBody.value !== null) {
+    data._editBody = timelineBaselineEditBody.value;
+  }
   if (timelineBaselineEnhanced.value !== null) {
     fromData.enhancedLrc = timelineBaselineEnhanced.value;
   }

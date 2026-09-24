@@ -673,7 +673,7 @@ onUnmounted(() => {
       <UiButton
         size="small"
         :disabled="!dirty"
-        title="撤销所有时间轴编辑（含整体偏移/开始时间调整），恢复到编辑前的原始时间轴"
+        title="撤销所有时间轴编辑（含整体偏移/开始时间调整与左面板文本改动），恢复到编辑前的原始状态"
         @click="emit('reset')"
       >
         撤销
