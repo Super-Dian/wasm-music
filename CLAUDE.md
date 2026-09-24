@@ -19,6 +19,8 @@ bilibili-music is a Tampermonkey userscript that injects into Bilibili video pag
 
 **Package manager**: npm. **Linter/formatter**: oxlint + oxfmt (Oxc toolchain, not ESLint/Prettier).
 
+> 注：`npm run lint`（type-aware 模式）在部分环境会因 tsgolint 版本不匹配直接 panic（`unknown rule`，干净工作区同样复现），此时用 `npx oxlint <files>` 跑基础规则替代。
+
 ## Architecture
 
 ### Injection Model
@@ -33,7 +35,7 @@ The app is a modal with a vertical steps sidebar:
 1. **clip.vue** — Audio trimming (delete ranges, speed)
 2. **info.vue** — Title/author/filename metadata with template placeholders
 3. **cover.vue** — Cover art selection (video cover, music cover, UP avatar)
-4. **lyrics.vue** — Lyrics selection, editing, online search, AI correction, smart correction
+4. **lyrics.vue** — Lyrics selection, editing, online search, AI correction, smart correction + visual timeline editor（歌词工作台「时间轴」Tab）
 5. **audio.vue** — FFmpeg WASM pipeline: fetch audio → transcode M4S→M4A → embed clip/speed/metadata/cover/lyrics → download via FileSaver
 
 ### State Management
@@ -53,9 +55,11 @@ Key `userConfig` fields:
 
 - `openai: { host, key, modal }` — OpenAI-compatible API for AI lyrics correction
 
-### Auto-imports
+### Auto-imports 与组件导入约定
 
-Vue APIs (`ref`, `computed`, `watch`, etc.) are auto-imported via `unplugin-auto-import` — do NOT add explicit imports in `.vue` files. Components from `src/steps/` and `src/components/` are auto-registered via `unplugin-vue-components`.
+- Vue APIs（`ref`、`computed`、`watch`、`nextTick` 等）由 `unplugin-auto-import` 自动导入 —— `.vue` 文件中**不要**写显式 Vue API import。
+- **组件必须显式 import**（如 `import UiButton from "@/components/UiButton.vue"`）——这是全仓约定。历史上 `unplugin-vue-components` 的 `include: /.vue$/` 覆盖了插件默认值，导致生产构建中带查询串的 TS SFC 子请求（`Foo.vue?vue&type=script&lang.ts`）匹配失败：组件不注入、回退 `resolveComponent`，渲染成无样式的未知元素（**dev 正常、构建坏**；`vite.config` 的 onwarn 还静默了该警告）。include 已恢复插件默认，但显式导入仍是兜底惯例（unplugin 的正则仍不匹配自引用形式 `_resolveComponent("Name", true)!`）。
+- `auto-imports.d.ts` / `components.d.ts` 为生成文件：构建时再生成、`fmt` 会重排其格式，属正常变更。
 
 ### Path Alias
 
@@ -75,17 +79,19 @@ Vue APIs (`ref`, `computed`, `watch`, etc.) are auto-imported via `unplugin-auto
 **Online Lyrics Search** (two-step API):
 
 - `onlineLyricsApis` defines search sources (currently LuoXueAPI at `api.vkeys.cn`).
-- Step 1: `searchOnlineLyrics()` queries `?word=歌曲名` → returns `{ data: [{ id, name }] }`.
+- Step 1: `searchOnlineLyrics()` queries `?word=歌曲名` → returns `{ data: [{ id, name, singer }] }`（`singer` 与 `id` 同层级，可能是字符串或数组；候选下拉显示「歌名 - 歌手」，无 singer 时回退仅歌名）。
 - Step 2: Watcher on `onlineLyricsIndex` fetches lyrics via `detailUrl + ?id=songId` → returns `{ data: { lrc } }`.
 - `lyricsIdMap` caches `compositeKey → songId` mapping between steps.
 
 **Lyrics Workshop Modal** (fullscreen):
 
-- Left panel: editable textarea (`_editBody`) for the selected subtitle track.
+- Left panel: editable textarea (`_editBody`) for the selected subtitle track. **时间轴 Tab 激活时左面板 `v-show` 收起**（右列全宽），由「显示文本面板」按钮切换；必须用 `v-show` 而非 `v-if`（保留 textarea 的 undo 栈）。左面板行数与时间轴行数不一致时实时 `UiAlert` 警告（口径与 `onTimelineCommit`/`next()` 的行数守恒一致）。
 - Right panel tabs:
   - **在线歌词** — search, select, toggle formatting (timeAxis/blankChar/metaInfo/stripMeta), editable preview with diff view toggle, replace/undo/smart-correct buttons.
   - **AI 改写** — OpenAI-compatible API with custom prompt template (`{{onlineLyrics}}` placeholder). Strict typo correction only.
   - **结果预览** — final lyrics with ♪ note formatting.
+  - **时间轴** — 可视化歌词时间轴编辑器（详见下方「Lyrics Timeline」节）。
+- 已在在线模式（`useOnlineLyrics`）时**更换歌词源会自动重新应用**到左侧文本与时间轴（`watch(onlineLyricsIndex)` 拉取成功后触发；逐字源无 yrc 时仅警告）。
 
 **Smart Correction** (`src/utils/lyricsCorrector.ts`):
 
@@ -103,7 +109,7 @@ Vue APIs (`ref`, `computed`, `watch`, etc.) are auto-imported via `unplugin-auto
 
 - `parseLrcToLyrics(lrcText)` — parses LRC format into `Array<[ms, text]>` with time axis.
 - "使用在线歌词" switch in lyrics workshop enables automatic replacement with online lyrics time axis.
-- "第一句歌词开始时间" input (mm:ss format) allows adjusting the offset between video and online lyrics.
+- "第一句歌词开始时间" input (mm:ss format) allows adjusting the offset between video and online lyrics. 现为**相对当前首行的 delta 平移**（幂等、保留行级拖拽的相对编辑，不再从 pristine 快照整表重放）；超出歌曲时长会报错拦截（`getHostDurationMs()` 上界校验）。
 - `useOnlineLyrics` flag controls: disables max-length validation, enables OK button, disables smart correction.
 
 **External Lyrics** (`fromData.externalLyrics`):
@@ -125,6 +131,24 @@ Vue APIs (`ref`, `computed`, `watch`, etc.) are auto-imported via `unplugin-auto
 - 性能优化：鼠标移动使用 `requestAnimationFrame` 节流，避免高频 `mousemove` 导致卡顿
 - 虚拟位置：`displayTime` ref 与 `video.currentTime` 解耦，由 `timeupdate` 事件驱动同步
 - tooltip 复用对象引用，仅更新变化属性，减少 Vue 响应式开销
+
+### Lyrics Timeline（歌词时间轴）
+
+- `src/components/LyricsTimeline.vue` — 歌词工作台「时间轴」Tab 的可视化编辑器（约 1300 行，显式 import 四个 Ui 组件）。
+- **交互模型**：px/秒坐标 + 缩放视口（15/30/60s 预设、滚轮锚点缩放）；平移用 `transform: translateX`（非原生 overflow 滚动，故另手写**横向滚动条**：拖滑块平移、点轨道跳页）；`ResizeObserver` 观察轨道宽度驱动 `pxPerSec`。
+- **行级编辑**：拖拽改开始时间（**邻接夹紧**防乱序，`[prev.start, next.start]` 区间）、距播放指针 80ms 磁吸、对齐到播放指针、±100ms、整体偏移。**左对齐语义**：块右缘是派生的（自动延伸至下一句 start），只控 start——界面上有常驻说明。
+- **不支持插删块**：N 行文本 ↔ N 时间戳是 `next()`/`handleOk` 硬不变式，ai 模式还被 `body` zip 锁死。**合并歌词工作流** = 把块拖到极短 + 左面板把文本挪进前/后一句 + **保留空行**（行数不变）。空行渲染：预览上下句跳过、当前句显示「（空行）」，时间轴块为细线标记。
+- **渲染要点**：歌词块**不设 padding、不设最小宽度**（border-box 下 `width:0` 会被 padding+border 撑到 ~18px 压进下一句）；可见窗口行过滤；等时间戳合法、按序存储。
+- **播放指针**（界面对播放头的统一称呼）：`displayTimeMs` 非响应式、rAF 循环仅在播放中运行，每帧只直写 `transform`/状态栏文本（内容未变不写 DOM），活跃行二分查找跨句才更新；三个拖拽态（块拖/平移/滚动条）共享一对 document 监听 + rAF 分支。**禁止展开原生 MouseEvent**（clip.vue 曾因此丢 `clientX`）。
+- **数据流**：`getTimelineLines()` 按三模式物化（online/ai-corrected 读 `_lyricsBody`，纯 ai 为 `body.from × _editBody` zip）→ `onTimelineCommit` 行数守恒校验、**ai → ai-corrected 双 ref 提升**（否则 `next()` 只读 `body[].from` 会静默丢编辑）。编辑侧一律**源视频时间**（clip/speed 前），导出时才由 `processLyrics` 换算。
+- **溢出检查**：整体偏移钳制**统一位移量**到 `[-首句, 时长-末句]`（逐行 clamp 会让边界行堆叠破坏行距），被钳制时 info 提示实际生效值；「开始时间」/`handleOk` 有歌曲时长上界校验。
+- **同步 watcher（`_editBody → _lyricsBody` 单向）**：非 online、行数一致才回写文本（时间戳不动）。同一 watcher 负责**文本编辑激活撤销**：非抑制、非 online 的净变更拍「编辑前」基线（有表用表、无表用编辑前 zip，oldBody 为敲键前值）并置 `timelineDirty`；程序性写入（`editLyrics`/`undoReplace`/智能纠错/`resetTimelineEdits`）必须先 `markInternalEditBodyWrite()`（suppress + nextTick 复位），否则重开工作台撤销就亮。
+- **撤销（`resetTimelineEdits`）**：三方基线快照 `_lyricsBody` + `enhancedLrc` + `_editBody`（在 dirty false→true 的全部入口同刻捕获），一键整体回滚；空基线防御、恢复后按钮须熄灭（不自激活）。
+- **⚠️ `smartCorrected` 必须独立于 `lyricsMode`**：时间轴编辑会把 `ai` 提升为 `ai-corrected`（路由需要），再用 `lyricsMode === 'ai-corrected'` 判断智能纠错会误显示「已纠错」、误入取消分支清空 `_lyricsBody`。
+- **online 模式边界**：文本权威在右侧编辑框，左面板文本不参与同步/激活/导出（`handleOk` 以右侧 parse 为准）。
+- **联动**：时间轴选中 → 左面板 `focus + setSelectionRange` 跳转整行（软换行由浏览器算准；面板 `display:none` 时直接跳过）；「点击跳转指针」与「跟随播放指针」是**独立开关**；换源自动重应用、行数实时警告见工作台节。
+- **增强歌词**：行级拖拽不重排字级时间；全局偏移经 `shiftEnhancedLrc()` 对字符串内 `[mm:ss.mmm]`/`<mm:ss.mmm>` 标签整体平移（`parseYrc` 无法回读 Enhanced LRC，故不走 raw 重建）。
+- 工作台四个 Tab 用 `<Transition name="lyrics-tab" mode="out-in">` 切换（先出后进防双面板并排抖动）。
 
 ### TaskCenter（任务中心）
 
@@ -159,6 +183,7 @@ Vue APIs (`ref`, `computed`, `watch`, etc.) are auto-imported via `unplugin-auto
 - `src/utils/requests.ts` — HTTP request layer (GM_xmlhttpRequest wrapper)
 - `src/utils/ffmpeg.ts` — FFmpeg WASM loader with multi-thread detection and progress logging
 - `src/utils/lyricsCorrector.ts` — AI subtitle correction via character-level diff against online lyrics
+- `src/components/LyricsTimeline.vue` — 歌词时间轴可视化编辑器（工作台「时间轴」Tab，见 Lyrics Timeline 节）
 - `src/utils/drop.ts` — Drag-and-drop: parses dropped .wav ID3 tags to find source URL
 - `src/utils/gpt.ts` — OpenAI-compatible API wrapper for AI lyrics correction
 
