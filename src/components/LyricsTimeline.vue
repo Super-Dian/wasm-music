@@ -197,16 +197,21 @@ const previewCurrentRow = computed<PreviewRow | null>(() => {
   return idx >= 0 && idx < workingLines.value.length ? makePreviewRow(idx) : null;
 });
 
-const previewPrevRow = computed<PreviewRow | null>(() => {
-  const idx = activeIndex.value;
-  return idx > 0 && idx < workingLines.value.length ? makePreviewRow(idx - 1) : null;
-});
+/** 从 from 开始沿 step 方向找最近的非空文本行（跳过合并歌词后遗留的空行） */
+function findPreviewRow(from: number, step: -1 | 1): PreviewRow | null {
+  const lines = workingLines.value;
+  for (let i = from; i >= 0 && i < lines.length; i += step) {
+    if (lines[i][1].trim()) return makePreviewRow(i);
+  }
+  return null;
+}
+
+const previewPrevRow = computed<PreviewRow | null>(() => findPreviewRow(activeIndex.value - 1, -1));
 
 const previewNextRow = computed<PreviewRow | null>(() => {
-  const idx = activeIndex.value;
-  // 播放头在第一句之前时，把第一句当下一句展示
-  const nextIdx = idx < 0 ? 0 : idx + 1;
-  return nextIdx < workingLines.value.length ? makePreviewRow(nextIdx) : null;
+  // 播放头在第一句之前时，从第一句开始找
+  const start = activeIndex.value < 0 ? 0 : activeIndex.value + 1;
+  return findPreviewRow(start, 1);
 });
 
 function cloneLines(lines: Lyrics): Lyrics {
@@ -745,7 +750,12 @@ onUnmounted(() => {
       >
         <template v-if="previewCurrentRow">
           <span class="lt-preview-time">{{ previewCurrentRow.time }}</span>
-          <span class="lt-preview-text">{{ previewCurrentRow.text || "♪" }}</span>
+          <span
+            class="lt-preview-text"
+            :class="{ 'lt-preview-empty-text': !previewCurrentRow.text.trim() }"
+          >
+            {{ previewCurrentRow.text.trim() ? previewCurrentRow.text : "（空行）" }}
+          </span>
           <span class="lt-preview-index">
             {{ previewCurrentRow.i + 1 }}/{{ workingLines.length }}
           </span>
@@ -1005,6 +1015,12 @@ onUnmounted(() => {
   color: var(--color-bili-text-secondary, #666);
 }
 
+/* 当前句为合并遗留的空行时的占位样式 */
+.lt-preview-empty-text {
+  font-weight: 500;
+  color: var(--color-bili-text-muted, #999);
+}
+
 .lt-clip-mask {
   position: absolute;
   top: 0;
@@ -1158,6 +1174,11 @@ body[data-theme="dark"] .lt-preview-empty:hover {
 body[arco-theme="dark"] .lt-preview-index,
 body[data-theme="dark"] .lt-preview-index {
   color: #999;
+}
+
+body[arco-theme="dark"] .lt-preview-empty-text,
+body[data-theme="dark"] .lt-preview-empty-text {
+  color: #666;
 }
 
 body[arco-theme="dark"] .lt-divider,

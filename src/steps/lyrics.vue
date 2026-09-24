@@ -548,6 +548,20 @@ watch(
   },
 );
 
+/**
+ * 左面板行数 vs 时间轴行数的实时校准警告（口径与 onTimelineCommit / next()
+ * 的行数守恒一致）。online 未应用前左侧仍是 AI 文本、天然不齐，不告警。
+ */
+const timelineLineMismatch = computed<{ text: number; timeline: number } | null>(() => {
+  const data = editLyricsData.value?.data;
+  if (!data) return null;
+  if (lyricsMode.value === "online" && !data._lyricsBody?.length) return null;
+  const textCount = (data._editBody ?? "").split("\n").length;
+  const timelineCount = getTimelineLines().length;
+  if (timelineCount === 0 || textCount === timelineCount) return null;
+  return { text: textCount, timeline: timelineCount };
+});
+
 const leftTextareaRef = ref<InstanceType<typeof UiTextarea> | null>(null);
 
 /**
@@ -1491,6 +1505,15 @@ function openWorkshop(item?: SubTitle) {
             :rows="20"
             @paste="handleLeftPanelPaste"
           />
+          <UiAlert
+            v-if="timelineLineMismatch"
+            type="warning"
+            style="margin-top: 8px; flex-shrink: 0"
+          >
+            ⚠️ 文本行数（{{ timelineLineMismatch?.text }}）与时间轴行数（{{
+              timelineLineMismatch?.timeline
+            }}）不一致：请勿增删换行，否则时间轴提交与「下一步」会被阻止；合并歌词时删空一行请保留空行占位。
+          </UiAlert>
           <div class="lyrics-left-footer">
             <span>格式化：</span>
             <UiCheckbox v-model="lyricsBodySwitch.note"> ♪ </UiCheckbox>
