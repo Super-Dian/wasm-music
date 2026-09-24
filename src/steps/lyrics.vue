@@ -527,6 +527,27 @@ function resetTimelineEdits() {
   Message.success("已恢复原始时间轴");
 }
 
+/**
+ * 左面板文本 → _lyricsBody 单向同步（合并歌词块的基础能力）：
+ * 在以 _lyricsBody 为权威的模式（ai-corrected 等）下，把左面板文本按 index
+ * 回写到 _lyricsBody，时间戳不动——预览、时间轴块文本、导出（next() 的
+ * ai-corrected 覆盖路径）随之实时生效。
+ * - online 模式跳过：文本权威在右侧编辑框（handleOk 会用右侧 parse 覆盖左面板）
+ * - 行数不一致跳过（增删换行的场景，由行数警告层负责提示），行数恢复后自愈
+ * - 不改 timelineDirty：纯文本变更不影响撤销/OK 的时间语义
+ */
+watch(
+  () => editLyricsData.value?.data?._editBody,
+  (body) => {
+    if (lyricsMode.value === "online") return;
+    const data = editLyricsData.value?.data;
+    if (!data?._lyricsBody?.length) return;
+    const lines = (body ?? "").split("\n");
+    if (lines.length !== data._lyricsBody.length) return;
+    data._lyricsBody = data._lyricsBody.map(([t], i): [number, string] => [t, lines[i]]);
+  },
+);
+
 const leftTextareaRef = ref<InstanceType<typeof UiTextarea> | null>(null);
 
 /**
