@@ -235,6 +235,12 @@ const editLyricsData = ref<SubTitle | null>(null);
 
 type LyricsMode = "ai" | "ai-corrected" | "online";
 const lyricsMode = ref<LyricsMode>("ai");
+/**
+ * 是否真正执行过「智能纠错」。
+ * 不能用 lyricsMode === 'ai-corrected' 判断：时间轴编辑也会把 ai 提升为
+ * ai-corrected（next() 路由需要），与纠错无关，会误显示「已纠错」且误入取消分支。
+ */
+const smartCorrected = ref(false);
 const originalAiBody = ref<Body[]>([]);
 const originalAiText = ref("");
 
@@ -849,6 +855,19 @@ watch(onlineLyricsIndex, async (value) => {
     // WYSIWYG：初始化缓存并应用当前格式化选项
     cachedNormalLyrics.value = lrc;
     applyFormatting();
+    // 已在使用在线歌词时更换歌词源：自动重新应用到左侧文本与时间轴，
+    // 否则左侧仍显示旧源的内容（需要手动再点一次「使用在线歌词」）
+    if (useOnlineLyrics.value) {
+      if (lyricsType.value === "enhanced") {
+        if (onlineYrc.value) {
+          applyEnhancedLyrics();
+        } else {
+          Message.warning("新歌词源没有逐字歌词，请切换为普通歌词或重新选择");
+        }
+      } else {
+        replaceWithOnlineLyrics();
+      }
+    }
   } catch (err) {
     if (onlineLyricsIndex.value !== value) return;
     logger.error("[lyrics] 歌词详情请求失败:", err);
@@ -877,6 +896,7 @@ function replaceWithOnlineLyrics() {
       editLyricsData.value.data._lyricsBody = [];
       originalParsedLyrics.value = [];
       timelineDirty.value = false;
+      smartCorrected.value = false;
       return;
     }
 
@@ -889,6 +909,7 @@ function replaceWithOnlineLyrics() {
     editLyricsData.value.data._editBody = parsedLyrics.map(([, text]) => text).join("\n");
     // 整表重建时间轴基线：清除时间轴编辑记账
     timelineDirty.value = false;
+    smartCorrected.value = false;
 
     const firstTimeMs = parsedLyrics[0][0];
     const minutes = Math.floor(firstTimeMs / 60000);
@@ -909,6 +930,7 @@ function undoReplaceLyrics() {
   editLyricsData.value.data._editBody = originalAiText.value;
   editLyricsData.value.data._lyricsBody = [];
   timelineDirty.value = false;
+  smartCorrected.value = false;
   lyricsMode.value = "ai";
   subtitleEditMode.value = "ai";
   originalEditBody.value = "";
@@ -952,6 +974,7 @@ function applyEnhancedLyrics() {
   // 行级歌词用于音频嵌入时的兼容处理
   editLyricsData.value.data._lyricsBody = wordLyrics.map((line) => [line.startMs, line.text]);
   timelineDirty.value = false;
+  smartCorrected.value = false;
 
   fromData.enhancedLrc = enhancedLrc;
   fromData.useEnhancedLyrics = true;
@@ -975,13 +998,14 @@ function applyEnhancedLyrics() {
 
 /** 智能纠错：用在线歌词纠正 AI 字幕的错别字，再次点击取消纠错 */
 function smartCorrectLyrics() {
-  // 取消纠错：恢复为原始 AI 歌词
-  if (lyricsMode.value === "ai-corrected") {
+  // 取消纠错：恢复为原始 AI 歌词（仅在真正执行过纠错时；时间轴提升的 ai-corrected 不算）
+  if (smartCorrected.value) {
     if (originalEditBody.value) {
       editLyricsData.value!.data!._editBody = originalEditBody.value;
     }
     editLyricsData.value!.data!._lyricsBody = [];
     timelineDirty.value = false;
+    smartCorrected.value = false;
     lyricsMode.value = "ai";
     subtitleEditMode.value = "ai";
     originalEditBody.value = "";
@@ -1012,6 +1036,7 @@ function smartCorrectLyrics() {
   editLyricsData.value.data._lyricsBody = lyrics;
   editLyricsData.value.data._editBody = lyrics.map((item) => item[1]).join("\n");
   timelineDirty.value = false;
+  smartCorrected.value = true;
   lyricsMode.value = "ai-corrected";
   subtitleEditMode.value = "ai-corrected";
   originalParsedLyrics.value = [];
@@ -1156,10 +1181,17 @@ async function fetchOnlineSearch(api: (typeof onlineLyricsApis)[number], word: s
       const list = Array.isArray(res?.data)
         ? res.data
             .filter((song: any) => song?.id != null && (song?.name || song?.song))
-            .map((song: any) => ({
-              id: String(song.id),
-              name: String(song.name || song.song),
-            }))
+            .map((song: any) => {
+              // 歌手与 id 同层级（singer 字段，可能是字符串或数组）
+              const rawSinger = song.singer;
+              const singer =
+                typeof rawSinger === "string"
+                  ? rawSinger
+                  : Array.isArray(rawSinger)
+                    ? rawSinger.map((s: unknown) => String(s)).join("/")
+                    : "";
+              return { id: String(song.id), name: String(song.name || song.song), singer };
+            })
         : [];
       const result = { songs: list, expiresAt: Date.now() + SEARCH_CACHE_TTL };
       // 仅当搜索结果不为空时才写入缓存，避免空结果导致后续无法重新搜索
@@ -1228,7 +1260,11 @@ async function searchOnlineLyrics() {
           const opt: SelectOptionGroup = { isGroup: true, label: item.label, options: [] };
           for (const song of result.songs) {
             const value = item.label + "." + song.id;
-            opt.options.push({ label: song.name, value });
+            // 候选列表展示「歌名 - 歌手」；无歌手信息时只显示歌名
+            opt.options.push({
+              label: song.singer ? `${song.name} - ${song.singer}` : song.name,
+              value,
+            });
             lyricsIdMap.value[value] = song.id;
           }
           onlineLyricsOptions.value.push(opt);
@@ -1266,6 +1302,7 @@ function editLyrics(item: SubTitle) {
     lyricsStartTimeError.value = false;
     useOnlineLyrics.value = false;
     timelineDirty.value = false;
+    smartCorrected.value = false;
     lyricsType.value = fromData.useEnhancedLyrics ? "enhanced" : "normal";
     // 将 ♪ 复选框默认设为勾选（预览时显示 ♪）
     lyricsBodySwitch.note = false;
@@ -1502,7 +1539,10 @@ function openWorkshop(item?: SubTitle) {
                   :disabled="!useOnlineLyrics"
                   @change="onLyricsStartTimeChange"
                 />
-                <UiButton :disabled="lyricsMode === 'ai'" @click="undoReplaceLyrics">
+                <UiButton
+                  :disabled="!useOnlineLyrics && !smartCorrected"
+                  @click="undoReplaceLyrics"
+                >
                   ↩ 撤销
                 </UiButton>
               </div>
@@ -1512,11 +1552,11 @@ function openWorkshop(item?: SubTitle) {
               </UiAlert>
               <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px">
                 <UiButton
-                  :type="lyricsMode === 'ai-corrected' ? 'primary' : 'outline'"
+                  :type="smartCorrected ? 'primary' : 'outline'"
                   :disabled="!onlineLyrics || useOnlineLyrics"
                   @click="smartCorrectLyrics"
                 >
-                  {{ lyricsMode === "ai-corrected" ? "✓ 已纠错" : "智能纠错" }}
+                  {{ smartCorrected ? "✓ 已纠错" : "智能纠错" }}
                 </UiButton>
                 <UiCheckbox v-model="lyricsBodySwitch.stripMetaPlain"
                   >智能保留歌词正文（纯文本）</UiCheckbox
