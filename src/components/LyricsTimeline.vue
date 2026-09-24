@@ -76,6 +76,9 @@ const bodyEl = ref<HTMLElement | null>(null);
 const trackEl = ref<HTMLElement | null>(null);
 const playheadEl = ref<HTMLElement | null>(null);
 const timeEl = ref<HTMLElement | null>(null);
+const scrollTrackEl = ref<HTMLElement | null>(null);
+/** 横向滚动条拖拽状态（普通对象，避免响应式开销） */
+const scrollbar = { active: false, startClientX: 0, startView: 0 };
 
 const WINDOW_PRESETS = [15, 30, 60];
 /** 拖拽磁吸播放头的阈值（ms） */
@@ -95,6 +98,19 @@ const contentEndMs = computed(() => {
 });
 
 const viewMaxStart = computed(() => Math.max(0, contentEndMs.value - windowSec.value * 1000));
+
+/** 滚动条内容总长（至少一个窗口，避免除零） */
+const contentTotalMs = computed(() => Math.max(contentEndMs.value, windowSec.value * 1000));
+
+/** 滑块位置：纯百分比，随视口平移 / 缩放 / 播放跟随实时联动 */
+const scrollThumbStyle = computed(() => {
+  const total = contentTotalMs.value;
+  const winMs = windowSec.value * 1000;
+  return {
+    left: `${(viewStartMs.value / total) * 100}%`,
+    width: `${Math.min(100, (winMs / total) * 100)}%`,
+  };
+});
 
 function setViewStart(ms: number) {
   const v = Math.min(Math.max(0, ms), viewMaxStart.value);
@@ -363,6 +379,34 @@ function onBodyMouseDown(e: MouseEvent) {
   document.addEventListener("mouseup", onDocMouseUp);
 }
 
+/** 滚动条滑块拖拽：像素位移按「轨道宽 / 内容总长」换算为时间平移 */
+function onScrollbarThumbDown(e: MouseEvent) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  scrollbar.active = true;
+  scrollbar.startClientX = e.clientX;
+  scrollbar.startView = viewStartMs.value;
+  document.addEventListener("mousemove", onDocMouseMove);
+  document.addEventListener("mouseup", onDocMouseUp);
+}
+
+function applyScrollbar(clientX: number) {
+  const track = scrollTrackEl.value;
+  if (!track) return;
+  const rect = track.getBoundingClientRect();
+  const deltaMs = ((clientX - scrollbar.startClientX) / rect.width) * contentTotalMs.value;
+  setViewStart(scrollbar.startView + deltaMs);
+}
+
+/** 点击轨道空白处：视口中心跳到点击位置 */
+function onScrollbarTrackDown(e: MouseEvent) {
+  if (e.button !== 0 || !scrollTrackEl.value) return;
+  const rect = scrollTrackEl.value.getBoundingClientRect();
+  const ratio = (e.clientX - rect.left) / rect.width;
+  setViewStart(ratio * contentTotalMs.value - (windowSec.value * 1000) / 2);
+}
+
 function onDocMouseMove(e: MouseEvent) {
   // 事件派发后同步捕获坐标，rAF 内消费（勿展开原生 MouseEvent，会丢失 clientX）
   pendingClientX = e.clientX;
@@ -371,6 +415,7 @@ function onDocMouseMove(e: MouseEvent) {
     docRafId = 0;
     if (drag.active) applyDrag(pendingClientX);
     else if (pan.active) applyPan(pendingClientX);
+    else if (scrollbar.active) applyScrollbar(pendingClientX);
   });
 }
 
@@ -406,6 +451,8 @@ function onDocMouseUp(e: MouseEvent) {
       seekTo(t);
     }
     pan.active = false;
+  } else if (scrollbar.active) {
+    scrollbar.active = false;
   }
 
   if (resyncPending) {
@@ -608,6 +655,7 @@ onUnmounted(() => {
   resizeObserver = null;
   drag.active = false;
   pan.active = false;
+  scrollbar.active = false;
 });
 </script>
 
@@ -727,6 +775,21 @@ onUnmounted(() => {
       <div ref="playheadEl" class="lt-playhead"></div>
     </div>
     <UiAlert v-else type="info">暂无歌词时间轴数据，请先加载歌词。</UiAlert>
+
+    <!-- 横向滚动条：拖动滑块快速平移视口，点击轨道跳页（transform 平移架构下原生 overflow 滚动不可用，手写实现） -->
+    <div
+      v-if="workingLines.length"
+      ref="scrollTrackEl"
+      class="lt-scrollbar"
+      title="拖动快速平移时间轴，点击轨道跳转"
+      @mousedown="onScrollbarTrackDown"
+    >
+      <div
+        class="lt-scrollbar-thumb"
+        :style="scrollThumbStyle"
+        @mousedown.stop="onScrollbarThumbDown"
+      ></div>
+    </div>
 
     <!-- 当前歌词预览：跟随播放指针所在句（上一句/当前句/下一句），点击任意行跳转试听。
          固定行高 + 单行省略，行切换与左面板开合引起的宽度变化都不造成布局抖动 -->
@@ -919,6 +982,32 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   /* 替代块本体的右内边距，收在自身盒内不影响父块占位 */
   padding-right: 8px;
+}
+
+/* 横向滚动条 */
+.lt-scrollbar {
+  position: relative;
+  height: 12px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(0, 174, 236, 0.08);
+  border: 1px solid var(--color-bili-border, #e3e5e7);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.lt-scrollbar-thumb {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  min-width: 16px;
+  border-radius: 5px;
+  background: rgba(0, 174, 236, 0.45);
+  cursor: grab;
+}
+
+.lt-scrollbar-thumb:hover {
+  background: rgba(0, 174, 236, 0.65);
 }
 
 /* 当前歌词预览：宽度 100% 随右列（左面板开合）自适应；
@@ -1179,6 +1268,22 @@ body[data-theme="dark"] .lt-preview-index {
 body[arco-theme="dark"] .lt-preview-empty-text,
 body[data-theme="dark"] .lt-preview-empty-text {
   color: #666;
+}
+
+body[arco-theme="dark"] .lt-scrollbar,
+body[data-theme="dark"] .lt-scrollbar {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: #444;
+}
+
+body[arco-theme="dark"] .lt-scrollbar-thumb,
+body[data-theme="dark"] .lt-scrollbar-thumb {
+  background: rgba(0, 174, 236, 0.5);
+}
+
+body[arco-theme="dark"] .lt-scrollbar-thumb:hover,
+body[data-theme="dark"] .lt-scrollbar-thumb:hover {
+  background: rgba(0, 174, 236, 0.7);
 }
 
 body[arco-theme="dark"] .lt-divider,

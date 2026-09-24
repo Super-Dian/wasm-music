@@ -1785,6 +1785,11 @@ function openWorkshop(item?: SubTitle) {
               @select="onTimelineSelect"
               @reset="resetTimelineEdits"
             />
+            <UiAlert type="info" style="margin-top: 8px">
+              💡
+              时间轴采用「左对齐」编辑逻辑（与常见剪辑软件不同）：每个色块只控制本句的开始时间，右侧自动延伸填充至下一句的开始位置（自动对齐，不产生间隙或重叠）。若遇到异常
+              bug，点击下方「取消」关闭工作台并重新进入，即可重置工作状态。
+            </UiAlert>
           </div>
         </UiTabs>
       </div>
