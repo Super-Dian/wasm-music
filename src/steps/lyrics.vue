@@ -269,6 +269,14 @@ const originalParsedLyrics = ref<Array<[number, string]>>([]);
  * 否则会吞掉行级拖拽编辑。任何整表重建 _lyricsBody 的函数都应将其重置为 false。
  */
 const timelineDirty = ref(false);
+/**
+ * 首次编辑（时间轴拖拽/整体偏移/开始时间）前的时间轴快照，供「撤销」恢复。
+ * 仅在 timelineDirty false→true 的两个入口（onTimelineCommit /
+ * applyGlobalStartTimeDelta）捕获；dirty=false 期间按钮禁用，不会用到旧值。
+ */
+const timelineBaseline = ref<Lyrics | null>(null);
+/** 与 timelineBaseline 同刻的 enhancedLrc 快照（null 表示当时未记录） */
+const timelineBaselineEnhanced = ref<string | null>(null);
 
 /**
  * 切换使用在线歌词状态
@@ -421,6 +429,11 @@ function applyGlobalStartTimeDelta(startTimeMs: number): boolean {
   if (!data?._lyricsBody?.length) return false;
   const delta = startTimeMs - data._lyricsBody[0][0];
   if (delta === 0) return true;
+  // dirty false→true：捕获原始时间轴快照（含 enhancedLrc），供撤销恢复
+  if (!timelineDirty.value) {
+    timelineBaseline.value = data._lyricsBody.map(([t, s]): [number, string] => [t, s]);
+    timelineBaselineEnhanced.value = fromData.enhancedLrc;
+  }
   data._lyricsBody = data._lyricsBody.map(([t, s]) => [Math.max(0, t + delta), s]);
   shiftEnhancedLrc(delta);
   timelineDirty.value = true;
@@ -472,6 +485,11 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
     Message.error("时间轴行数与歌词不一致");
     return;
   }
+  // dirty false→true：捕获编辑前的原始时间轴快照（含 enhancedLrc）
+  if (!timelineDirty.value) {
+    timelineBaseline.value = getTimelineLines().map(([t, s]): [number, string] => [t, s]);
+    timelineBaselineEnhanced.value = fromData.enhancedLrc;
+  }
   const normalized: Lyrics = next.map(([ms, t]) => [Math.max(0, Math.round(ms)), t]);
   data._lyricsBody = normalized;
   if (lyricsMode.value === "ai") {
@@ -482,6 +500,25 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
   lyricsStartTime.value = formatStartTimeMs(normalized[0][0]);
   lyricsStartTimeError.value = false;
   if (globalDelta) shiftEnhancedLrc(globalDelta);
+}
+
+/**
+ * 撤销所有时间轴编辑：恢复到首次编辑前的原始时间轴快照。
+ * 会同步恢复 enhancedLrc、清 dirty、把「开始时间」输入重指到基线首行；
+ * ai 模式曾被提升为 ai-corrected 但基线内容与原 AI zip 等价，无需回退模式。
+ */
+function resetTimelineEdits() {
+  const data = editLyricsData.value?.data;
+  if (!timelineDirty.value || !timelineBaseline.value || !data) return;
+  const restored: Lyrics = timelineBaseline.value.map(([t, s]): [number, string] => [t, s]);
+  data._lyricsBody = restored;
+  if (timelineBaselineEnhanced.value !== null) {
+    fromData.enhancedLrc = timelineBaselineEnhanced.value;
+  }
+  timelineDirty.value = false;
+  lyricsStartTime.value = formatStartTimeMs(restored[0][0]);
+  lyricsStartTimeError.value = false;
+  Message.success("已恢复原始时间轴");
 }
 
 const leftTextareaRef = ref<InstanceType<typeof UiTextarea> | null>(null);
@@ -1649,8 +1686,10 @@ function openWorkshop(item?: SubTitle) {
               :lines="timelineLines"
               :enhanced="fromData.useEnhancedLyrics"
               :clip-ranges="fromData.clipRanges"
+              :dirty="timelineDirty"
               @commit="onTimelineCommit"
               @select="onTimelineSelect"
+              @reset="resetTimelineEdits"
             />
           </div>
         </UiTabs>

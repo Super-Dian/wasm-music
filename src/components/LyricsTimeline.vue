@@ -13,17 +13,21 @@ const props = withDefaults(
     lines: Lyrics;
     enhanced?: boolean;
     clipRanges?: ClipRanges | null;
+    /** 父级 timelineDirty：是否存在可撤销的时间轴编辑 */
+    dirty?: boolean;
   }>(),
   {
     lines: () => [],
     enhanced: false,
     clipRanges: null,
+    dirty: false,
   },
 );
 
 const emit = defineEmits<{
   (e: "commit", lines: Lyrics, globalDelta?: number): void;
   (e: "select", index: number): void;
+  (e: "reset"): void;
 }>();
 
 /** 宿主 B 站播放器 video（与 clip.vue 同源选择器） */
@@ -60,6 +64,8 @@ const activeIndex = ref(-1);
 const isPlaying = ref(false);
 const hasVideo = ref(false);
 const followPlayhead = ref(true);
+/** 点击时间块时是否将播放指针跳到该块开始时间（与「跟随播放指针」相互独立的两个功能） */
+const seekOnClick = ref(true);
 const windowSec = ref(30);
 const viewStartMs = ref(0);
 const trackW = ref(0);
@@ -377,8 +383,9 @@ function onDocMouseUp(e: MouseEvent) {
       applyDrag(e.clientX);
       replaceLine(i, drag.lastT);
     } else {
-      // 未超过阈值视为点击：seek 到该行试听
-      seekTo(drag.startMs);
+      // 未超过阈值视为点击：是否跳转播放指针由「点击跳转指针」选项控制；
+      // 选中（selectedId/文本同步）不受该选项影响，始终执行
+      if (seekOnClick.value) seekTo(drag.startMs);
     }
     selectedId.value = i;
     // 选中行变化 → 通知父级同步左侧文本面板（点击与拖拽松手均触发一次）
@@ -629,6 +636,12 @@ onUnmounted(() => {
         {{ w }}s
       </UiButton>
       <UiCheckbox v-model="followPlayhead">跟随播放指针</UiCheckbox>
+      <UiCheckbox
+        v-model="seekOnClick"
+        title="开启后，点击时间块会将播放指针跳到该块的开始时间；关闭后点击仅选中该块（不影响跟随播放指针）"
+      >
+        点击跳转指针
+      </UiCheckbox>
       <span class="lt-divider"></span>
       <span class="lt-label">整体偏移(秒)</span>
       <UiInput
@@ -651,6 +664,14 @@ onUnmounted(() => {
       </UiButton>
       <UiButton size="small" :disabled="selectedId === null" @click="nudgeSelected(100)">
         +100ms
+      </UiButton>
+      <UiButton
+        size="small"
+        :disabled="!dirty"
+        title="撤销所有时间轴编辑（含整体偏移/开始时间调整），恢复到编辑前的原始时间轴"
+        @click="emit('reset')"
+      >
+        撤销
       </UiButton>
     </div>
 
