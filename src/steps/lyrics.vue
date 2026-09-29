@@ -1534,11 +1534,17 @@ function openWorkshop(item?: SubTitle) {
       <div v-if="editLyricsData && editLyricsData.data" class="lyrics-workspace">
         <!-- 时间轴 tab 下收起左面板让右列全宽；必须用 v-show 以保留 textarea 的 undo 栈 -->
         <div v-show="activeTab !== '4' || showTimelineText" class="lyrics-left-panel">
+          <!-- online 模式文本权威在右框（handleOk 从右框整表重建 _editBody），左面板编辑不生效 -->
+          <div v-if="lyricsMode === 'online'" class="lyrics-left-hint">
+            ⚠️
+            在线歌词模式下左侧文本为只读展示，此处修改不会生效；文本请在右侧「在线歌词」面板编辑，时间对齐请用「时间轴」Tab。
+          </div>
           <UiTextarea
             ref="leftTextareaRef"
             class="lyrics-left-textarea"
             v-model="editLyricsData.data._editBody"
             :rows="20"
+            :readonly="lyricsMode === 'online'"
             @paste="handleLeftPanelPaste"
           />
           <UiAlert
@@ -2037,6 +2043,24 @@ body[arco-theme="dark"] .lyrics-preview-text {
   flex: 1;
   min-height: 0;
   resize: none;
+}
+/* 在线歌词模式：左面板只读提示 */
+.lyrics-left-hint {
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border: 1px dashed #91d5ff;
+  border-radius: 6px;
+  background: #e6f7ff;
+  color: #1070b0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+body[arco-theme="dark"] .lyrics-left-hint,
+body[data-theme="dark"] .lyrics-left-hint {
+  background: #112636;
+  border-color: #15395b;
+  color: #4aa3e8;
 }
 .lyrics-left-footer {
   display: flex;

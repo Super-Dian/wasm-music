@@ -136,6 +136,11 @@ body[data-theme="dark"] .ui-textarea-disabled {
   color: #666;
 }
 
+body[arco-theme="dark"] .ui-textarea-readonly,
+body[data-theme="dark"] .ui-textarea-readonly {
+  background: #1f1f1f;
+}
+
 body[arco-theme="dark"] .ui-textarea-word-limit,
 body[data-theme="dark"] .ui-textarea-word-limit {
   color: #666;

@@ -1,9 +1,16 @@
 # 待办：歌词工作台左面板编辑在「在线歌词」模式下生效
 
-> 状态：**排查完成，方案未拍板（暂停中，待自行规划后再实现）**
-> 关联提交：前一功能（逐字时间轴写回 / 高亮 / 字条微调 / 删除开始时间）已合入 `c9cd16a`。
-> 右框定位已确认：**保持可编辑**（字级结构手改入口，与左面板经行拼接同步）。
-> 生效范围未定：仅逐字模式 vs 普通在线模式也放开。
+> 状态：**已决策——不实现该功能；改为「只读 + 视觉提示」（已实现）**
+> 决策依据：在线歌词一般本身是准确的，用户只需用「时间轴」Tab 对齐开头，左面板改文本收益低；
+> 但用户默认不知道在线模式下左面板编辑不生效，因此只需给出视觉提示。
+> 实现内容：
+>
+> 1. `src/steps/lyrics.vue` 左面板顶部增加 `lyricsMode === 'online'` 时的只读提示条（`.lyrics-left-hint`，含暗色适配）；
+> 2. 同条件下 `UiTextarea` 传 `:readonly`，杜绝敲字后被 `handleOk` 从右框整表重建静默冲掉。
+>    下文第二、三节保留为排查记录，**不再需要实现**（若日后重新评估，决策点仍在）。
+>    关联提交：前一功能（逐字时间轴写回 / 高亮 / 字条微调 / 删除开始时间）已合入 `c9cd16a`。
+>    右框定位已确认：**保持可编辑**（字级结构手改入口，与左面板经行拼接同步）。
+>    ~~生效范围未定：仅逐字模式 vs 普通在线模式也放开。~~（随功能取消而失效）
 
 ## 一、问题本质
 
@@ -11,7 +18,7 @@
   根源是 `_editBody` watcher 入口的守卫（`src/steps/lyrics.vue`，`watch(() => editLyricsData.../_editBody` 内）：
 
   ```ts
-  if (lyricsMode.value === "online") return;   // 在线模式整段跳过
+  if (lyricsMode.value === "online") return; // 在线模式整段跳过
   ```
 
 - **为什么这样设计**（CLAUDE.md「online 模式边界」）：在线模式的文本权威是**右侧在线歌词编辑框**——
@@ -24,14 +31,14 @@
 
 ## 二、关键代码事实（行号可能漂移，以函数名为准）
 
-| 位置 | 事实 |
-| --- | --- |
-| `_editBody` watcher | 守卫 `mode === "online"` 整段 return；非在线时做：撤销基线捕获（dirty false→true）→ `_lyricsBody` 文本回写（行数一致才写） |
-| `next()` | online → 读 `_lyricsBody`；ai → `_editBody` 按行 zip 进 `body[].from`（行数必须等于 AI 字幕行数）；ai-corrected → 读 `_lyricsBody` |
-| `handleOk` | online 普通：dirty 时文本取右框 parse（行数一致），非 dirty 整表从框重建；online 逐字：`textsDiffer` 门（框文本 vs enhancedLrc 文本）决定是否按框重基，否则仅 `syncEnhancedLrcFromTimeline()` 归并时间 |
-| `applyEnhancedLyrics` | 写 `_editBody` 时**没有** `markInternalEditBodyWrite()`——目前靠 watcher 的 online 守卫兜底；一旦放开守卫必须补 |
-| `parseEnhancedLrc`（`src/utils/yrcParser.ts`） | 跳过无行标签行、秒≥60、**无内容行**（`!rest.trim()` continue / `words.length===0` continue）→ 逐字模式下「留空行占位」的合并工作流天然不通 |
-| 撤销基线 | 三方快照 `_lyricsBody` + `enhancedLrc` + `_editBody`（三处 dirty 捕获点：`onTimelineCommit` / `onTimelineWordCommit` / `_editBody` watcher）；**不含右框** |
+| 位置                                           | 事实                                                                                                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `_editBody` watcher                            | 守卫 `mode === "online"` 整段 return；非在线时做：撤销基线捕获（dirty false→true）→ `_lyricsBody` 文本回写（行数一致才写）                                                                             |
+| `next()`                                       | online → 读 `_lyricsBody`；ai → `_editBody` 按行 zip 进 `body[].from`（行数必须等于 AI 字幕行数）；ai-corrected → 读 `_lyricsBody`                                                                     |
+| `handleOk`                                     | online 普通：dirty 时文本取右框 parse（行数一致），非 dirty 整表从框重建；online 逐字：`textsDiffer` 门（框文本 vs enhancedLrc 文本）决定是否按框重基，否则仅 `syncEnhancedLrcFromTimeline()` 归并时间 |
+| `applyEnhancedLyrics`                          | 写 `_editBody` 时**没有** `markInternalEditBodyWrite()`——目前靠 watcher 的 online 守卫兜底；一旦放开守卫必须补                                                                                         |
+| `parseEnhancedLrc`（`src/utils/yrcParser.ts`） | 跳过无行标签行、秒≥60、**无内容行**（`!rest.trim()` continue / `words.length===0` continue）→ 逐字模式下「留空行占位」的合并工作流天然不通                                                             |
+| 撤销基线                                       | 三方快照 `_lyricsBody` + `enhancedLrc` + `_editBody`（三处 dirty 捕获点：`onTimelineCommit` / `onTimelineWordCommit` / `_editBody` watcher）；**不含右框**                                             |
 
 ## 三、方案决策点（规划用）
 
@@ -60,6 +67,7 @@
 
 ## 五、上一功能（c9cd16a）遗留验证
 
+- [ ] 手动 R0：在线模式左面板顶部出现只读提示、文本框 readonly（灰底、暗色同样可辨）；时间轴选中仍能跳转选中行；AI/智能纠错模式下无提示且可正常编辑
 - [ ] `npm test`（需 bun；本机当时未装，`tests/yrcParser.test.ts` 的断言已用 Node 24 原生 TS 等价验证过）
 - [ ] 手动 R1：在线 Tab 无开始时间输入；时间轴整体偏移/拖拽完成对齐 → 导出时间正确
 - [ ] 手动 R2：逐字「智能保留（保留时间轴/纯文本）」生效、与普通模式提示一致；改右框文本后「使用在线歌词」生效且不覆写框
