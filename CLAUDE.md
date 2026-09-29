@@ -80,7 +80,7 @@ Key `userConfig` fields:
 
 - `onlineLyricsApis` defines search sources (currently LuoXueAPI at `api.vkeys.cn`).
 - Step 1: `searchOnlineLyrics()` queries `?word=歌曲名` → returns `{ data: [{ id, name, singer }] }`（`singer` 与 `id` 同层级，可能是字符串或数组；候选下拉显示「歌名 - 歌手」，无 singer 时回退仅歌名）。
-- Step 2: Watcher on `onlineLyricsIndex` fetches lyrics via `detailUrl + ?id=songId` → returns `{ data: { lrc } }`.
+- Step 2: Watcher on `onlineLyricsIndex` fetches lyrics via `detailUrl + ?id=songId` → returns `{ lrc, yrc }`（yrc 为逐字源）.
 - `lyricsIdMap` caches `compositeKey → songId` mapping between steps.
 
 **Lyrics Workshop Modal** (fullscreen):
@@ -109,8 +109,9 @@ Key `userConfig` fields:
 
 - `parseLrcToLyrics(lrcText)` — parses LRC format into `Array<[ms, text]>` with time axis.
 - "使用在线歌词" switch in lyrics workshop enables automatic replacement with online lyrics time axis.
-- "第一句歌词开始时间" input (mm:ss format) allows adjusting the offset between video and online lyrics. 现为**相对当前首行的 delta 平移**（幂等、保留行级拖拽的相对编辑，不再从 pristine 快照整表重放）；超出歌曲时长会报错拦截（`getHostDurationMs()` 上界校验）。
+- **对齐只在时间轴 Tab**：原「第一句歌词开始时间」输入已删除（与时间轴「整体偏移」重复）——首句位置用整体偏移/行级拖拽/对齐到播放指针调整，时长边界由 `applyShiftAll` 的统一位移钳制与 `clampLine` 覆盖。
 - `useOnlineLyrics` flag controls: disables max-length validation, enables OK button, disables smart correction.
+- **逐字歌词以右侧编辑框为源**（`applyEnhancedLyrics`/`handleOk` 走 `parseEnhancedLrc` 直读手改内容，不覆写框）：智能保留（`isMetaLine` 在**解析后的行文本**上过滤——原始 Enhanced 行以 `<...>` 开头会击穿 key:value 正则）与手动删行/改词都与普通模式同口径生效；框非空但无时间轴（如勾「纯文本」）报「没有有效时间轴」，空框才回退 YRC。
 
 **External Lyrics** (`fromData.externalLyrics`):
 
@@ -134,20 +135,23 @@ Key `userConfig` fields:
 
 ### Lyrics Timeline（歌词时间轴）
 
-- `src/components/LyricsTimeline.vue` — 歌词工作台「时间轴」Tab 的可视化编辑器（约 1300 行，显式 import 四个 Ui 组件）。
+- `src/components/LyricsTimeline.vue` — 歌词工作台「时间轴」Tab 的可视化编辑器（约 1550 行，显式 import 四个 Ui 组件）。
 - **交互模型**：px/秒坐标 + 缩放视口（15/30/60s 预设、滚轮锚点缩放）；平移用 `transform: translateX`（非原生 overflow 滚动，故另手写**横向滚动条**：拖滑块平移、点轨道跳页）；`ResizeObserver` 观察轨道宽度驱动 `pxPerSec`。
 - **行级编辑**：拖拽改开始时间（**邻接夹紧**防乱序，`[prev.start, next.start]` 区间）、距播放指针 80ms 磁吸、对齐到播放指针、±100ms、整体偏移。**左对齐语义**：块右缘是派生的（自动延伸至下一句 start），只控 start——界面上有常驻说明。
 - **不支持插删块**：N 行文本 ↔ N 时间戳是 `next()`/`handleOk` 硬不变式，ai 模式还被 `body` zip 锁死。**合并歌词工作流** = 把块拖到极短 + 左面板把文本挪进前/后一句 + **保留空行**（行数不变）。空行渲染：预览上下句跳过、当前句显示「（空行）」，时间轴块为细线标记。
 - **渲染要点**：歌词块**不设 padding、不设最小宽度**（border-box 下 `width:0` 会被 padding+border 撑到 ~18px 压进下一句）；可见窗口行过滤；等时间戳合法、按序存储。
 - **播放指针**（界面对播放头的统一称呼）：`displayTimeMs` 非响应式、rAF 循环仅在播放中运行，每帧只直写 `transform`/状态栏文本（内容未变不写 DOM），活跃行二分查找跨句才更新；三个拖拽态（块拖/平移/滚动条）共享一对 document 监听 + rAF 分支。**禁止展开原生 MouseEvent**（clip.vue 曾因此丢 `clientX`）。
 - **数据流**：`getTimelineLines()` 按三模式物化（online/ai-corrected 读 `_lyricsBody`，纯 ai 为 `body.from × _editBody` zip）→ `onTimelineCommit` 行数守恒校验、**ai → ai-corrected 双 ref 提升**（否则 `next()` 只读 `body[].from` 会静默丢编辑）。编辑侧一律**源视频时间**（clip/speed 前），导出时才由 `processLyrics` 换算。
-- **溢出检查**：整体偏移钳制**统一位移量**到 `[-首句, 时长-末句]`（逐行 clamp 会让边界行堆叠破坏行距），被钳制时 info 提示实际生效值；「开始时间」/`handleOk` 有歌曲时长上界校验。
+- **溢出检查**：整体偏移钳制**统一位移量**到 `[-首句, 时长-末句]`（逐行 clamp 会让边界行堆叠破坏行距），被钳制时 info 提示实际生效值；字条微调按行内词邻接 + `[行start, 下一行start|时长]` 钳制。原「开始时间」输入及其 `handleOk` 时长校验已删除。
 - **同步 watcher（`_editBody → _lyricsBody` 单向）**：非 online、行数一致才回写文本（时间戳不动）。同一 watcher 负责**文本编辑激活撤销**：非抑制、非 online 的净变更拍「编辑前」基线（有表用表、无表用编辑前 zip，oldBody 为敲键前值）并置 `timelineDirty`；程序性写入（`editLyrics`/`undoReplace`/智能纠错/`resetTimelineEdits`）必须先 `markInternalEditBodyWrite()`（suppress + nextTick 复位），否则重开工作台撤销就亮。
 - **撤销（`resetTimelineEdits`）**：三方基线快照 `_lyricsBody` + `enhancedLrc` + `_editBody`（在 dirty false→true 的全部入口同刻捕获），一键整体回滚；空基线防御、恢复后按钮须熄灭（不自激活）。
 - **⚠️ `smartCorrected` 必须独立于 `lyricsMode`**：时间轴编辑会把 `ai` 提升为 `ai-corrected`（路由需要），再用 `lyricsMode === 'ai-corrected'` 判断智能纠错会误显示「已纠错」、误入取消分支清空 `_lyricsBody`。
 - **online 模式边界**：文本权威在右侧编辑框，左面板文本不参与同步/激活/导出（`handleOk` 以右侧 parse 为准）。
 - **联动**：时间轴选中 → 左面板 `focus + setSelectionRange` 跳转整行（软换行由浏览器算准；面板 `display:none` 时直接跳过）；「点击跳转指针」与「跟随播放指针」是**独立开关**；换源自动重应用、行数实时警告见工作台节。
-- **增强歌词**：行级拖拽不重排字级时间；全局偏移经 `shiftEnhancedLrc()` 对字符串内 `[mm:ss.mmm]`/`<mm:ss.mmm>` 标签整体平移（`parseYrc` 无法回读 Enhanced LRC，故不走 raw 重建）。
+- **增强歌词行级写回（`syncEnhancedLrcFromTimeline`）**：每次 commit 按行计算 `delta = _lyricsBody[i][0] − enhancedLrc行start`，经 `shiftTimestampsInLine` 对该物理行的行标签+全部字标签统一平移（行内间距不变、逐标签钳 ≥0、幂等、行数不齐跳过并 warn）——行级拖拽/整体偏移**全部进导出**，替代旧 `shiftEnhancedLrc`/`globalDelta` 通道（防双重平移，`commit` emit 不再带 delta）。字符串手术而非整表重序列化：行级文档与框内元信息行字节保真。
+- **handleOk 归并契约（逐字）**：时间权威 `_lyricsBody`（总被重基）＞ 框 ＞ `enhancedLrc`；文本权威框 ＞ `enhancedLrc`；字条微调存于 `enhancedLrc`，**`textsDiffer` 门**（框文本与 enhancedLrc 文本有差异才按框重建）保住它——否则 `watch(formatKey)` 用 pristine 重建框后会静默丢掉字条编辑。行数不齐警告保时间轴；非 dirty 整表从框重建。
+- **逐字高亮（预览区当前行）**：`enhancedWordLines` computed 解析 `enhancedLrc`（事件级，绝不读播放头）→ `wordLines` prop；`updateActiveIndex` 末尾**行锚定**算词（绝对 = 时间轴行 start + 词相对 offset，拖拽中高亮随色块走）并**门控写** `activeWordIndex`（词级频率，rAF 每帧只读不写）；资格不满足（非逐字/行级文档/行数不齐/文本未归并/空行）回退纯文本。
+- **字条微调（工具栏下第二行）**：选中行显示字 chips（点选=选词，开「点击跳转指针」时跳到词的行锚定时间）+ ±10/±50ms + 对齐到播放指针；钳制 `[prev词, next词]`、首词≥行 start、末词≤下一行 start|时长。`commitWords` emit → 父级 `onTimelineWordCommit` 改写该行字级时间、**框行拼接同步**（仅该行且框文本仍匹配时，保住元信息行与其它行待编辑文本）、捕获 dirty 基线（与 `onTimelineCommit` 同模式，撤销可回滚）；`_lyricsBody` 不动。
 - 工作台四个 Tab 用 `<Transition name="lyrics-tab" mode="out-in">` 切换（先出后进防双面板并排抖动）。
 
 ### TaskCenter（任务中心）

@@ -1,7 +1,12 @@
 <script lang="ts" setup>
 import { fromData, Lyrics, userConfig } from "@/data";
-import type { WordLyrics } from "@/data";
-import { parseYrc, wordLyricsToEnhancedLrc, wordLyricsToStandardLrc } from "@/utils/yrcParser";
+import type { WordLyrics, WordTiming } from "@/data";
+import {
+  parseEnhancedLrc,
+  parseYrc,
+  shiftTimestampsInLine,
+  wordLyricsToEnhancedLrc,
+} from "@/utils/yrcParser";
 import { onMounted, ref, computed, reactive } from "vue";
 import { request } from "@/utils/requests";
 import Btn from "@/components/btn.vue";
@@ -39,6 +44,7 @@ import {
   correctLyrics,
   cleanOriginalLyrics,
   cleanOriginalLyricsPlain,
+  isMetaLine,
 } from "@/utils/lyricsCorrector";
 import { selectSubtitleForAuto, subtitleToLyrics } from "@/utils/lyrics";
 
@@ -256,10 +262,6 @@ const showTimelineText = ref(false);
 /** 是否显示 OpenAI 设置面板 */
 const showOpenAISettings = ref(false);
 
-/** 第一句歌词开始时间（mm:ss格式） */
-const lyricsStartTime = ref("");
-const lyricsStartTimeError = ref(false);
-
 /** 是否使用在线歌词 */
 const useOnlineLyrics = ref(false);
 /** 歌词类型：normal=普通LRC, enhanced=逐字Enhanced LRC */
@@ -267,18 +269,16 @@ const lyricsType = ref<"normal" | "enhanced">("normal");
 /** 缓存普通 LRC 格式的在线歌词，用于切换回普通格式时恢复 */
 const cachedNormalLyrics = ref("");
 
-/** 在线歌词原始解析结果（未偏移），用于 offset 计算基准 */
-const originalParsedLyrics = ref<Array<[number, string]>>([]);
 /**
  * 时间轴（Tab 4）是否手动编辑过 _lyricsBody。
- * 为 true 时 handleOk / 开始时间 不得再从 textarea/YRC 快照整表重写 _lyricsBody，
+ * 为 true 时 handleOk 不得再从 textarea/YRC 快照整表重写 _lyricsBody，
  * 否则会吞掉行级拖拽编辑。任何整表重建 _lyricsBody 的函数都应将其重置为 false。
  */
 const timelineDirty = ref(false);
 /**
- * 首次编辑（时间轴拖拽/整体偏移/开始时间）前的时间轴快照，供「撤销」恢复。
- * 仅在 timelineDirty false→true 的两个入口（onTimelineCommit /
- * applyGlobalStartTimeDelta）捕获；dirty=false 期间按钮禁用，不会用到旧值。
+ * 首次编辑（时间轴拖拽/整体偏移/字条微调/左面板文本）前的时间轴快照，供「撤销」恢复。
+ * 仅在 timelineDirty false→true 的入口（onTimelineCommit / onTimelineWordCommit /
+ * _editBody watcher）捕获；dirty=false 期间按钮禁用，不会用到旧值。
  */
 const timelineBaseline = ref<Lyrics | null>(null);
 /** 与 timelineBaseline 同刻的 enhancedLrc 快照（null 表示当时未记录） */
@@ -312,65 +312,15 @@ watch(lyricsType, (newType) => {
 
   if (newType === "enhanced") {
     if (!onlineYrc.value) return;
-    // 缓存当前普通格式，然后应用逐字格式
+    // 缓存当前普通格式（切回 normal 时恢复），再从 YRC 重建——
+    // 走 applyFormatting 使「智能保留歌词正文」等格式化选项对逐字格式同样即刻生效
     cachedNormalLyrics.value = editableOnlineLyrics.value;
-    const wordLyrics = parseYrc(onlineYrc.value);
-    if (wordLyrics.length === 0) return;
-    editableOnlineLyrics.value = wordLyricsToEnhancedLrc(wordLyrics);
+    applyFormatting();
   } else {
     // 恢复缓存的普通格式并重新应用当前格式化选项
     applyFormatting();
   }
 });
-
-/**
- * 验证并调整歌词时间轴
- * @returns 调整后的毫秒数，如果无效返回null
- */
-function parseLyricsStartTime(timeStr: string): number | null {
-  const match = timeStr.match(/^(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?$/);
-  if (!match) return null;
-
-  const minutes = parseInt(match[1], 10);
-  const seconds = parseInt(match[2], 10);
-  const fraction = match[3] ?? "0";
-
-  if (seconds >= 60) return null;
-
-  return minutes * 60 * 1000 + seconds * 1000 + parseInt(fraction.padEnd(3, "0"), 10);
-}
-
-/**
- * 当开始时间输入变化时，实时调整歌词时间轴。
- * 相对「当前首行」做整体 delta 平移（幂等：同值重复输入 → delta=0），
- * 保留时间轴已有的行级相对编辑；不再从 pristine 快照整表重放。
- * 注：UiInput 的 change 事件运行时可能传出原生 Event，此处同时兼容。
- */
-function onLyricsStartTimeChange(value: string | Event) {
-  const timeStr = typeof value === "string" ? value : lyricsStartTime.value;
-  if (!timeStr) {
-    lyricsStartTimeError.value = true;
-    return;
-  }
-
-  const startTimeMs = parseLyricsStartTime(timeStr);
-  if (startTimeMs === null) {
-    lyricsStartTimeError.value = true;
-    return;
-  }
-
-  lyricsStartTimeError.value = false;
-
-  if (lyricsMode.value !== "online") return;
-  // 溢出检查：首行时间不得移出歌曲结束
-  const durMs = getHostDurationMs();
-  if (durMs > 0 && startTimeMs > durMs) {
-    lyricsStartTimeError.value = true;
-    Message.error("开始时间超出歌曲时长");
-    return;
-  }
-  applyGlobalStartTimeDelta(startTimeMs);
-}
 
 /**
  * 解析 LRC 格式的歌词，提取时间轴和歌词文本
@@ -399,60 +349,40 @@ function parseLrcToLyrics(lrcText: string): Array<[number, string]> {
   return result.sort((a, b) => a[0] - b[0]);
 }
 
-/** 将毫秒格式化为与「开始时间」输入一致的 mm:ss.mmm */
-function formatStartTimeMs(ms: number): string {
-  const v = Math.max(0, Math.round(ms));
-  const m = Math.floor(v / 60000);
-  const s = Math.floor((v % 60000) / 1000);
-  const f = v % 1000;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}`;
-}
-
 /**
- * 对 Enhanced LRC 字符串整体平移所有时间标签（[mm:ss.mmm] 行标签与 <mm:ss.mmm> 字标签）。
- * parseYrc 只能解析 YRC 原始格式、无法回读 enhancedLrc，故直接对字符串做绝对平移：
- * 不依赖 raw 基线、保留既有偏移，且每次只叠加当次 delta。
+ * 行级写回：把 _lyricsBody 的行级时间按行整体平移同步进 enhancedLrc
+ * （该行行标签 + 全部字标签同移，行内相对间隔不变）。
+ *
+ * - 幂等：delta 由当前解析结果推导，同步后再调用全为 0；
+ * - 字符串手术（shiftTimestampsInLine）而非整表重序列化：
+ *   行级文档（timeAxis 关闭的无字标签文档）、框内元信息行等非结构行字节保真；
+ * - 行数不齐（框/表发生结构性变化）时整体跳过并警告，由 handleOk 归并；
+ * - 行级拖拽与整体偏移统一走此函数，替代旧的 globalDelta 通道（防双重平移）。
+ * @returns 是否完成同步
  */
-function shiftEnhancedLrc(deltaMs: number) {
-  if (!fromData.useEnhancedLyrics || !fromData.enhancedLrc || !deltaMs) return;
-  fromData.enhancedLrc = fromData.enhancedLrc.replace(
-    /([<[])(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?([>\]])/g,
-    (_m, open: string, mm: string, ss: string, frac: string | undefined, close: string) => {
-      const base = Number(mm) * 60000 + Number(ss) * 1000 + Number((frac ?? "0").padEnd(3, "0"));
-      const ms = Math.max(0, base + deltaMs);
-      const m = Math.floor(ms / 60000);
-      const s = Math.floor((ms % 60000) / 1000);
-      const f = ms % 1000;
-      return `${open}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}${close}`;
-    },
-  );
-}
-
-/**
- * 将整表对齐到目标首行时间（全局 delta 平移，保留行级相对编辑）。
- * @returns 是否执行了处理（无可用 _lyricsBody 时 false）
- */
-function applyGlobalStartTimeDelta(startTimeMs: number): boolean {
+function syncEnhancedLrcFromTimeline(): boolean {
   const data = editLyricsData.value?.data;
-  if (!data?._lyricsBody?.length) return false;
-  const delta = startTimeMs - data._lyricsBody[0][0];
-  if (delta === 0) return true;
-  // dirty false→true：捕获原始时间轴快照（含 enhancedLrc），供撤销恢复
-  if (!timelineDirty.value) {
-    timelineBaseline.value = data._lyricsBody.map(([t, s]): [number, string] => [t, s]);
-    timelineBaselineEnhanced.value = fromData.enhancedLrc;
-    timelineBaselineEditBody.value = data._editBody ?? "";
+  if (!fromData.useEnhancedLyrics || !fromData.enhancedLrc || !data?._lyricsBody?.length) {
+    return false;
   }
-  data._lyricsBody = data._lyricsBody.map(([t, s]) => [Math.max(0, t + delta), s]);
-  shiftEnhancedLrc(delta);
-  timelineDirty.value = true;
+  const parsed = parseEnhancedLrc(fromData.enhancedLrc);
+  if (parsed.lines.length !== data._lyricsBody.length) {
+    logger.warn("[lyrics] enhancedLrc 与时间轴行数不一致，跳过行级写回:", {
+      enhanced: parsed.lines.length,
+      timeline: data._lyricsBody.length,
+    });
+    return false;
+  }
+  const rawLines = fromData.enhancedLrc.split(/\r?\n/);
+  let changed = false;
+  for (let i = 0; i < parsed.lines.length; i++) {
+    const delta = data._lyricsBody[i][0] - parsed.lines[i].startMs;
+    if (!delta) continue;
+    rawLines[parsed.rawIndices[i]] = shiftTimestampsInLine(rawLines[parsed.rawIndices[i]], delta);
+    changed = true;
+  }
+  if (changed) fromData.enhancedLrc = rawLines.join("\n");
   return true;
-}
-
-/** 宿主歌曲时长（ms）；取不到时返回 0，调用方据此跳过上界检查 */
-function getHostDurationMs(): number {
-  const video = document.querySelector<HTMLVideoElement>(".bpx-player-video-wrap video");
-  return video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration * 1000 : 0;
 }
 
 /**
@@ -482,11 +412,23 @@ function getTimelineLines(): Lyrics {
 const timelineLines = computed(() => getTimelineLines());
 
 /**
+ * 逐字高亮/字条的数据源：enhancedLrc 的解析副本。
+ * 事件级重算（仅 enhancedLrc 写入时触发），绝不读播放头——
+ * 播放头驱动的高亮由 LyricsTimeline 内部的门控 activeWordIndex 负责。
+ * 行级文档（timeAxis 关闭、无 <...> 标签）返回 null：无高亮无字条。
+ */
+const enhancedWordLines = computed<WordLyrics | null>(() => {
+  if (!fromData.useEnhancedLyrics || !fromData.enhancedLrc) return null;
+  const parsed = parseEnhancedLrc(fromData.enhancedLrc);
+  return parsed.hasWordTags && parsed.lines.length ? parsed.lines : null;
+});
+
+/**
  * LyricsTimeline 的 commit 写回：行数守恒校验 → _lyricsBody →
  * ai 模式提升为 ai-corrected（否则 next() 只读 body[].from 会静默丢弃编辑）→
- * 同步开始时间输入与逐字歌词。
+ * 逐字歌词按行写回 enhancedLrc。
  */
-function onTimelineCommit(next: Lyrics, globalDelta?: number) {
+function onTimelineCommit(next: Lyrics) {
   const data = editLyricsData.value?.data;
   if (!data) return;
   const expected = getTimelineLines().length;
@@ -507,16 +449,59 @@ function onTimelineCommit(next: Lyrics, globalDelta?: number) {
     subtitleEditMode.value = "ai-corrected";
   }
   timelineDirty.value = true;
-  lyricsStartTime.value = formatStartTimeMs(normalized[0][0]);
-  lyricsStartTimeError.value = false;
-  if (globalDelta) shiftEnhancedLrc(globalDelta);
+  syncEnhancedLrcFromTimeline();
+}
+
+/**
+ * 字条微调 commit：改写 enhancedLrc 中该行的字级时间（行标签不动，
+ * 行内各字按组件侧钳制后的时间写入）。同步右侧编辑框的对应物理行——
+ * 行拼接而非整框覆写：保住元信息行与其它行的待编辑文本；仅当框行数
+ * 一致且该行文本仍匹配时执行（该行文本已改则跳过，handleOk 的文本归并兜底）。
+ * _lyricsBody 不动（字词微调不改行时间）；dirty 基线捕获与 onTimelineCommit 同模式。
+ */
+function onTimelineWordCommit(lineIndex: number, words: WordTiming[]) {
+  const data = editLyricsData.value?.data;
+  if (!fromData.useEnhancedLyrics || !fromData.enhancedLrc || !data?._lyricsBody?.length) return;
+  const parsed = parseEnhancedLrc(fromData.enhancedLrc);
+  if (parsed.lines.length !== data._lyricsBody.length || !parsed.lines[lineIndex]) {
+    logger.warn("[lyrics] 字条微调跳过：enhancedLrc 与时间轴行数不一致", {
+      enhanced: parsed.lines.length,
+      timeline: data._lyricsBody.length,
+      lineIndex,
+    });
+    return;
+  }
+  // dirty false→true：捕获编辑前基线（含 enhancedLrc），供「撤销」整体回滚
+  if (!timelineDirty.value) {
+    timelineBaseline.value = getTimelineLines().map(([t, s]): [number, string] => [t, s]);
+    timelineBaselineEnhanced.value = fromData.enhancedLrc;
+    timelineBaselineEditBody.value = data._editBody ?? "";
+  }
+
+  const newLines = parsed.lines.map((line, i) => (i === lineIndex ? { ...line, words } : line));
+  fromData.enhancedLrc = wordLyricsToEnhancedLrc(newLines, parsed.hasWordTags);
+  timelineDirty.value = true;
+
+  // 编辑框行拼接同步：仅该行、且框文本仍与原行匹配时
+  const boxParsed = parseEnhancedLrc(editableOnlineLyrics.value);
+  if (
+    boxParsed.lines.length === parsed.lines.length &&
+    boxParsed.lines[lineIndex]?.text === parsed.lines[lineIndex].text
+  ) {
+    const arr = editableOnlineLyrics.value.split(/\r?\n/);
+    arr[boxParsed.rawIndices[lineIndex]] = wordLyricsToEnhancedLrc(
+      [newLines[lineIndex]],
+      parsed.hasWordTags,
+    );
+    editableOnlineLyrics.value = arr.join("\n");
+  }
 }
 
 /**
  * 撤销所有时间轴编辑：恢复到首次编辑前的原始快照。
- * 会同步恢复左面板文本（_editBody）、enhancedLrc、清 dirty、把「开始时间」
- * 输入重指到基线首行；ai 模式曾被提升为 ai-corrected 但基线内容与原 AI zip
- * 等价，无需回退模式。
+ * 会同步恢复左面板文本（_editBody）、enhancedLrc（含行级拖拽与字条微调）、
+ * 清 dirty；ai 模式曾被提升为 ai-corrected 但基线内容与原 AI zip 等价，
+ * 无需回退模式。
  */
 function resetTimelineEdits() {
   const data = editLyricsData.value?.data;
@@ -537,11 +522,6 @@ function resetTimelineEdits() {
     fromData.enhancedLrc = timelineBaselineEnhanced.value;
   }
   timelineDirty.value = false;
-  // 空基线防御：避免 restored[0] 取值抛错中断恢复流程
-  if (restored.length) {
-    lyricsStartTime.value = formatStartTimeMs(restored[0][0]);
-    lyricsStartTimeError.value = false;
-  }
   Message.success("已恢复原始时间轴");
 }
 
@@ -765,11 +745,12 @@ function applyFormatting() {
     if (wordLyrics.length === 0) return;
 
     let lines: WordLyrics;
-    // 智能保留：先过滤行再转 Enhanced LRC
-    if (lyricsBodySwitch.stripMetaPlain) {
-      lines = wordLyrics.filter((l) => l.text.trim());
-    } else if (lyricsBodySwitch.stripMeta) {
-      lines = wordLyrics.filter((l) => l.text.trim());
+    // 智能保留正文（与普通模式同口径）：在解析后的行文本上过滤标题/元信息行——
+    // 原始 Enhanced 行 content 以 `<...>` 开头会击穿 isMetaLine 的 key:value 正则，
+    // 必须先 parseYrc 再判断。不移植 stripMusicNotes（删 ♪ 会破坏 1 字符↔1 词映射，
+    // YRC 源本身不携带音符）。
+    if (lyricsBodySwitch.stripMetaPlain || lyricsBodySwitch.stripMeta) {
+      lines = wordLyrics.filter((l) => l.text.trim() && !isMetaLine(l.text));
     } else {
       lines = wordLyrics;
     }
@@ -792,6 +773,14 @@ function applyFormatting() {
     // 逐字时间轴：去掉 <mm:ss.sss> 内联标签（降级为行级时间戳）
     if (!lyricsBodySwitch.timeAxis) {
       enhanced = enhanced.replace(/<\d{1,3}:\d{2}\.\d{3}>/g, "");
+    }
+
+    // 纯文本：剥离全部时间标签（与 cleanOriginalLyricsPlain 对齐）。
+    // 此后点「使用在线歌词」因解析不出时间轴而报错，与普通模式表现一致。
+    if (lyricsBodySwitch.stripMetaPlain) {
+      enhanced = enhanced
+        .replace(/\[\d{1,3}:\d{2}[.:]\d{1,4}\]/g, "")
+        .replace(/<\d{1,3}:\d{2}\.\d{3}>/g, "");
     }
 
     editableOnlineLyrics.value = enhanced;
@@ -982,14 +971,12 @@ function replaceWithOnlineLyrics() {
       Message.warning("在线歌词中没有有效时间轴，请开启时间轴后再使用");
       useOnlineLyrics.value = false;
       editLyricsData.value.data._lyricsBody = [];
-      originalParsedLyrics.value = [];
       timelineDirty.value = false;
       smartCorrected.value = false;
       return;
     }
 
     originalEditBody.value = editLyricsData.value.data._editBody ?? originalAiText.value;
-    originalParsedLyrics.value = parsedLyrics.map(([time, text]) => [time, text]);
     lyricsMode.value = "online";
     subtitleEditMode.value = "online";
 
@@ -999,12 +986,6 @@ function replaceWithOnlineLyrics() {
     timelineDirty.value = false;
     smartCorrected.value = false;
 
-    const firstTimeMs = parsedLyrics[0][0];
-    const minutes = Math.floor(firstTimeMs / 60000);
-    const seconds = Math.floor((firstTimeMs % 60000) / 1000);
-    const milliseconds = firstTimeMs % 1000;
-    lyricsStartTime.value = `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${milliseconds.toString().padStart(3, "0")}`;
-    lyricsStartTimeError.value = false;
     useOnlineLyrics.value = true;
     Message.success("已替换为在线歌词（含时间轴）");
   } finally {
@@ -1023,9 +1004,6 @@ function undoReplaceLyrics() {
   lyricsMode.value = "ai";
   subtitleEditMode.value = "ai";
   originalEditBody.value = "";
-  originalParsedLyrics.value = [];
-  lyricsStartTime.value = "";
-  lyricsStartTimeError.value = false;
   useOnlineLyrics.value = false;
   lyricsType.value = "normal";
   aiRewriteContent.value = "";
@@ -1034,55 +1012,56 @@ function undoReplaceLyrics() {
   Message.success("已恢复原始歌词");
 }
 
-/** 使用在线逐字歌词：解析 YRC → Enhanced LRC，显示在右侧编辑框并嵌入音频 */
+/**
+ * 使用在线逐字歌词：右侧编辑框为结构与文本权威（parseEnhancedLrc 直读手改内容，
+ * 不覆写框），解析结果物化到 _editBody/_lyricsBody 并序列化 enhancedLrc 嵌入音频。
+ * 兜底仅限编辑框为空时从 pristine YRC 构建；框非空但无时间轴（如勾「纯文本」）
+ * 与普通模式同样报「没有有效时间轴」。
+ */
 function applyEnhancedLyrics() {
   if (!editLyricsData.value?.data) return;
 
-  if (!onlineYrc.value) {
-    Message.warning("当前歌曲无逐字歌词数据");
-    return;
-  }
+  const boxEmpty = !editableOnlineLyrics.value.trim();
+  let parsed = boxEmpty ? null : parseEnhancedLrc(editableOnlineLyrics.value);
 
-  const wordLyrics = parseYrc(onlineYrc.value);
-  if (wordLyrics.length === 0) {
-    Message.warning("逐字歌词解析失败或为空");
-    return;
+  if (!parsed || parsed.lines.length === 0) {
+    if (!boxEmpty) {
+      Message.warning("在线歌词中没有有效时间轴，请开启时间轴后再使用");
+      return;
+    }
+    if (!onlineYrc.value) {
+      Message.warning("当前歌曲无逐字歌词数据");
+      return;
+    }
+    const wordLyrics = parseYrc(onlineYrc.value);
+    if (wordLyrics.length === 0) {
+      Message.warning("逐字歌词解析失败或为空");
+      return;
+    }
+    editableOnlineLyrics.value = wordLyricsToEnhancedLrc(wordLyrics);
+    parsed = { lines: wordLyrics, hasWordTags: true, rawIndices: wordLyrics.map((_, i) => i) };
   }
-
-  const enhancedLrc = wordLyricsToEnhancedLrc(wordLyrics);
 
   // 保存原始状态用于撤销
   if (!originalEditBody.value) {
     originalEditBody.value = editLyricsData.value.data._editBody ?? originalAiText.value;
   }
 
-  // Enhanced LRC 显示在右侧在线歌词编辑框
-  editableOnlineLyrics.value = enhancedLrc;
+  const lines = parsed.lines;
   // 左侧编辑框保持纯文本（供用户查看/编辑歌词内容）
-  editLyricsData.value.data._editBody = wordLyrics.map((line) => line.text).join("\n");
-  // 行级歌词用于音频嵌入时的兼容处理
-  editLyricsData.value.data._lyricsBody = wordLyrics.map((line) => [line.startMs, line.text]);
+  editLyricsData.value.data._editBody = lines.map((line) => line.text).join("\n");
+  // 行级歌词：时间轴 UI 的数据源（导出以 enhancedLrc 为准）
+  editLyricsData.value.data._lyricsBody = lines.map((line) => [line.startMs, line.text]);
   timelineDirty.value = false;
   smartCorrected.value = false;
 
-  fromData.enhancedLrc = enhancedLrc;
+  fromData.enhancedLrc = wordLyricsToEnhancedLrc(lines, parsed.hasWordTags);
   fromData.useEnhancedLyrics = true;
   lyricsMode.value = "online";
   subtitleEditMode.value = "online";
   useOnlineLyrics.value = true;
 
-  // 初始化原始歌词解析结果，供 onLyricsStartTimeChange 计算偏移
-  originalParsedLyrics.value = wordLyrics.map((line) => [line.startMs, line.text]);
-
-  // 设置开始时间
-  const firstTimeMs = wordLyrics[0].startMs;
-  const minutes = Math.floor(firstTimeMs / 60000);
-  const seconds = Math.floor((firstTimeMs % 60000) / 1000);
-  const ms = firstTimeMs % 1000;
-  lyricsStartTime.value = `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
-  lyricsStartTimeError.value = false;
-
-  Message.success(`已启用逐字歌词（${wordLyrics.length} 行）`);
+  Message.success(`已启用逐字歌词（${lines.length} 行）`);
 }
 
 /** 智能纠错：用在线歌词纠正 AI 字幕的错别字，再次点击取消纠错 */
@@ -1130,8 +1109,6 @@ function smartCorrectLyrics() {
   smartCorrected.value = true;
   lyricsMode.value = "ai-corrected";
   subtitleEditMode.value = "ai-corrected";
-  originalParsedLyrics.value = [];
-  lyricsStartTime.value = "";
   useOnlineLyrics.value = false;
   Message.success("智能纠错完成，共替换 " + diffCount + " 个字符");
 }
@@ -1145,55 +1122,62 @@ function handleLeftPanelPaste(event: ClipboardEvent) {
 
 function handleOk() {
   if (lyricsMode.value === "online") {
-    const startTimeMs = parseLyricsStartTime(lyricsStartTime.value);
-    if (startTimeMs === null) {
-      Message.error("在线歌词开始时间无效");
-      lyricsStartTimeError.value = true;
-      return;
-    }
-
-    // 溢出检查：与开始时间输入同一规则，首行时间不得移出歌曲结束
-    const durMs = getHostDurationMs();
-    if (durMs > 0 && startTimeMs > durMs) {
-      Message.error("开始时间超出歌曲时长");
-      lyricsStartTimeError.value = true;
-      return;
-    }
-
     const data = editLyricsData.value!.data!;
 
-    if (fromData.useEnhancedLyrics && onlineYrc.value) {
+    if (fromData.useEnhancedLyrics) {
+      // 逐字歌词归并契约：时间权威 _lyricsBody（总被重基）＞ 框 ＞ enhancedLrc；
+      // 文本权威右侧编辑框 ＞ enhancedLrc；字条微调存于 enhancedLrc，
+      // 框文本一致时保留（textsDiffer 门——否则 formatKey 用 pristine 重建框后
+      // 会从旧字级时间整表覆盖、静默丢掉字条微调）。
+      const boxParsed = parseEnhancedLrc(editableOnlineLyrics.value);
+
       if (timelineDirty.value && data._lyricsBody?.length) {
-        // 时间轴已编辑：行级时间以 _lyricsBody 为准，跳过 YRC 整表重写（会吞掉行级拖拽）；
-        // 仅做首行与开始时间的防御性全局对齐 + 左侧文本行数自愈
-        applyGlobalStartTimeDelta(startTimeMs);
-        const editLines = (data._editBody ?? "").split("\n");
-        if (editLines.length !== data._lyricsBody.length) {
-          Message.warning("歌词行数与时间轴不一致，已按时间轴文本同步");
+        const enhParsed = parseEnhancedLrc(fromData.enhancedLrc);
+        const countOk = boxParsed.lines.length === data._lyricsBody.length;
+        const enhAligned = enhParsed.lines.length === data._lyricsBody.length;
+        const textsDiffer =
+          !enhAligned || boxParsed.lines.some((line, i) => line.text !== enhParsed.lines[i].text);
+
+        if (countOk && textsDiffer) {
+          // 框有待处理文本编辑：框结构按 _lyricsBody 时间重基（每行统一 δ 平移行+字）
+          const merged = boxParsed.lines.map((line, i) => {
+            const delta = data._lyricsBody![i][0] - line.startMs;
+            return {
+              startMs: data._lyricsBody![i][0],
+              text: line.text,
+              words: line.words.map((w) => ({ ...w, startMs: Math.max(0, w.startMs + delta) })),
+            };
+          });
+          fromData.enhancedLrc = wordLyricsToEnhancedLrc(merged, boxParsed.hasWordTags);
+          data._lyricsBody = merged.map((line, i): [number, string] => [
+            data._lyricsBody![i][0],
+            line.text,
+          ]);
+          data._editBody = merged.map((line) => line.text).join("\n");
+        } else if (countOk) {
+          // 无待处理文本编辑：不动 enhancedLrc 结构（保住字条微调），仅归并行级时间
+          syncEnhancedLrcFromTimeline();
+          data._editBody = boxParsed.lines.map((line) => line.text).join("\n");
+        } else {
+          Message.warning("在线歌词文本行数与时间轴不一致，已保留时间轴编辑");
           data._editBody = data._lyricsBody.map(([, text]) => text).join("\n");
+          // enhancedLrc 与时间轴的归并与框无关，独立执行
+          syncEnhancedLrcFromTimeline();
         }
       } else {
-        // 逐字歌词：重新解析 YRC 并应用偏移
-        const wordLyrics = parseYrc(onlineYrc.value);
-        if (wordLyrics.length === 0) {
-          Message.error("逐字歌词解析失败");
+        // 非 dirty：整表从框重建（框为权威），时间取框原值——对齐只走时间轴 Tab
+        if (boxParsed.lines.length === 0) {
+          Message.error("在线歌词时间轴无效，请开启时间轴后再使用");
           return;
         }
-        const offset = startTimeMs - wordLyrics[0].startMs;
-        const adjusted: WordLyrics = wordLyrics.map((line) => ({
-          ...line,
-          startMs: Math.max(0, line.startMs + offset),
-          words: line.words.map((w) => ({ ...w, startMs: Math.max(0, w.startMs + offset) })),
-        }));
-        fromData.enhancedLrc = wordLyricsToEnhancedLrc(adjusted);
-        data._lyricsBody = adjusted.map((line) => [line.startMs, line.text]);
-        data._editBody = adjusted.map((line) => line.text).join("\n");
-        originalParsedLyrics.value = adjusted.map((line) => [line.startMs, line.text]);
+        data._lyricsBody = boxParsed.lines.map((line) => [line.startMs, line.text]);
+        data._editBody = boxParsed.lines.map((line) => line.text).join("\n");
+        fromData.enhancedLrc = wordLyricsToEnhancedLrc(boxParsed.lines, boxParsed.hasWordTags);
       }
     } else {
       const parsedLyrics = parseLrcToLyrics(editableOnlineLyrics.value);
       if (timelineDirty.value && data._lyricsBody?.length) {
-        // 时间轴已编辑：时间保留 _lyricsBody，文本以右侧编辑框为准（行数一致时）
+        // 普通歌词：时间轴已编辑 → 时间保留 _lyricsBody，文本以右侧编辑框为准（行数一致时）
         if (parsedLyrics.length === data._lyricsBody.length) {
           data._lyricsBody = data._lyricsBody.map(([time], index): [number, string] => [
             time,
@@ -1204,16 +1188,13 @@ function handleOk() {
           Message.warning("在线歌词文本行数与时间轴不一致，已保留时间轴编辑");
           data._editBody = data._lyricsBody.map(([, text]) => text).join("\n");
         }
-        applyGlobalStartTimeDelta(startTimeMs);
       } else {
-        // 普通歌词（未触碰时间轴时走原有路径）
+        // 普通歌词（未触碰时间轴）：整表取框解析结果，无 offset（对齐只走时间轴 Tab）
         if (parsedLyrics.length === 0) {
           Message.error("在线歌词时间轴无效，请开启时间轴后再使用");
           return;
         }
-        const offset = startTimeMs - parsedLyrics[0][0];
-        originalParsedLyrics.value = parsedLyrics;
-        data._lyricsBody = parsedLyrics.map(([time, text]) => [Math.max(0, time + offset), text]);
+        data._lyricsBody = parsedLyrics;
         data._editBody = parsedLyrics.map(([, text]) => text).join("\n");
       }
     }
@@ -1388,9 +1369,6 @@ function editLyrics(item: SubTitle) {
     lyricsMode.value = hasAiBody ? "ai" : "online";
     subtitleEditMode.value = hasAiBody ? "ai" : "online";
     originalEditBody.value = "";
-    originalParsedLyrics.value = [];
-    lyricsStartTime.value = "";
-    lyricsStartTimeError.value = false;
     useOnlineLyrics.value = false;
     timelineDirty.value = false;
     smartCorrected.value = false;
@@ -1633,15 +1611,6 @@ function openWorkshop(item?: SubTitle) {
                   >
                     {{ useOnlineLyrics ? "✓ 已使用在线歌词" : "使用在线歌词" }}
                   </UiButton>
-                  <span>开始时间：</span>
-                  <UiInput
-                    v-model="lyricsStartTime"
-                    style="width: 100px"
-                    placeholder="mm:ss"
-                    :error="lyricsStartTimeError"
-                    :disabled="!useOnlineLyrics"
-                    @change="onLyricsStartTimeChange"
-                  />
                   <UiButton
                     :disabled="!useOnlineLyrics && !smartCorrected"
                     @click="undoReplaceLyrics"
@@ -1651,7 +1620,7 @@ function openWorkshop(item?: SubTitle) {
                 </div>
                 <UiAlert type="info" style="margin-bottom: 10px">
                   💡
-                  使用在线歌词：勾选后会自动替换歌词并使用在线歌词的时间轴。需要设置开始时间（即在线歌词中第一行在视频中出现的时间），为了方便对齐，可以勾选「智能保留歌词正文（保留时间轴）」快速删除在线歌词中的非正文部分（如标题，歌手）。若提示无时间轴，应当勾选「时间轴」选项。
+                  使用在线歌词：勾选后会自动替换歌词并使用在线歌词的时间轴。需要调整首句出现位置时，请到「时间轴」标签页用「整体偏移」或拖动色块对齐。为了方便对齐，可以勾选「智能保留歌词正文（保留时间轴）」快速删除在线歌词中的非正文部分（如标题，歌手）。若提示无时间轴，应当勾选「时间轴」选项。
                 </UiAlert>
                 <div style="margin: 10px 0; display: flex; align-items: center; gap: 8px">
                   <UiButton
@@ -1840,9 +1809,11 @@ function openWorkshop(item?: SubTitle) {
               <LyricsTimeline
                 :lines="timelineLines"
                 :enhanced="fromData.useEnhancedLyrics"
+                :word-lines="enhancedWordLines"
                 :clip-ranges="fromData.clipRanges"
                 :dirty="timelineDirty"
                 @commit="onTimelineCommit"
+                @commit-words="onTimelineWordCommit"
                 @select="onTimelineSelect"
                 @reset="resetTimelineEdits"
               />

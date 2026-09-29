@@ -106,16 +106,127 @@ export function parseYrc(yrcText: string): WordLyrics {
  * 将 WordLyrics 转换为 Enhanced LRC 字符串。
  *
  * 输出格式（逐字级）：
- *   [mm:ss.sss] <mm:ss.sss>char1 <mm:ss.sss>char2 ...
+ *   [mm:ss.sss]<mm:ss.sss>char1<mm:ss.sss>char2...
+ *
+ * @param hasWordTags false 时输出仅行标签的行级 LRC（timeAxis 关闭时的
+ *   「降级为行级时间戳」往返保真），默认 true 保持既有调用点输出字节不变。
  */
-export function wordLyricsToEnhancedLrc(wordLyrics: WordLyrics): string {
+export function wordLyricsToEnhancedLrc(wordLyrics: WordLyrics, hasWordTags = true): string {
   return wordLyrics
     .map((line) => {
       const lineTag = formatLrcTimestamp(line.startMs);
+      if (!hasWordTags) return `${lineTag}${line.text}`;
       const charTags = line.words.map((w) => `${formatWordTag(w.startMs)}${w.text}`).join("");
       return `${lineTag}${charTags}`;
     })
     .join("\n");
+}
+
+/** parseEnhancedLrc 的结果：行结构 + 是否含字级标签 + 行在源文本中的物理行号 */
+export type EnhancedParseResult = {
+  lines: WordLyrics;
+  /** 源文本至少含一个 <mm:ss.sss> 字级锚点（决定序列化是否输出字级标签） */
+  hasWordTags: boolean;
+  /** rawIndices[i] = lines[i] 在源文本中的物理行号（含被跳过的元信息行，供行级字符串手术定位） */
+  rawIndices: number[];
+};
+
+/**
+ * 解析 Enhanced LRC 为结构化数据（wordLyricsToEnhancedLrc 的逆运算）。
+ *
+ * 规则（与 parseLrcToLyrics / parseYrc 的跳行口径一致）：
+ * - 行首必须有 [mm:ss(.fff)] 行标签，否则整行跳过；秒≥60、内容为空也跳过；
+ * - 正文内 <mm:ss.sss> 为字锚点（正文中的 stray [mm:ss.sss] 也按锚点防御性处理，
+ *   避免时间戳污染文本）；锚点前的字符继承行起始时间，锚点 k 后的字符继承锚点 k
+ *   的时间直到下一锚点——序列化器给每个字符前置标签，本函数为其精确逆运算；
+ * - words[].durMs 恒为 0（Enhanced LRC 不承载时长）；结果按 startMs 稳定排序，
+ *   rawIndices 随行携带。
+ */
+export function parseEnhancedLrc(text: string): EnhancedParseResult {
+  const lines: WordLyrics = [];
+  const rawIndices: number[] = [];
+  let hasWordTags = false;
+
+  const rawLines = text.split(/\r?\n/);
+  for (let k = 0; k < rawLines.length; k++) {
+    const trimmed = rawLines[k].trim();
+    if (!trimmed) continue;
+
+    const lineTagMatch = trimmed.match(/^\[(\d{1,3}):(\d{2})(?:[.:](\d{1,4}))?\]/);
+    if (!lineTagMatch) continue;
+    const minutes = Number(lineTagMatch[1]);
+    const seconds = Number(lineTagMatch[2]);
+    if (seconds >= 60) continue;
+    const fraction = (lineTagMatch[3] ?? "0").slice(0, 3).padEnd(3, "0");
+    const lineStartMs = minutes * 60000 + seconds * 1000 + Number(fraction);
+
+    const rest = trimmed.slice(lineTagMatch[0].length);
+    if (!rest.trim()) continue;
+
+    // 锚点扫描：<mm:ss.sss> 与正文 stray [mm:ss.sss]；秒≥60 的匹配不作锚点（留作文本）
+    const anchorPattern = /[<[](\d{1,3}):(\d{2})(?:[.:](\d{1,4}))?[>\]]/g;
+    const anchors: Array<{ startMs: number; index: number; end: number }> = [];
+    let am: RegExpExecArray | null;
+    while ((am = anchorPattern.exec(rest)) !== null) {
+      const aMin = Number(am[1]);
+      const aSec = Number(am[2]);
+      if (aSec >= 60) continue;
+      if (am[0].startsWith("<")) hasWordTags = true;
+      const aFrac = (am[3] ?? "0").slice(0, 3).padEnd(3, "0");
+      anchors.push({
+        startMs: aMin * 60000 + aSec * 1000 + Number(aFrac),
+        index: am.index,
+        end: am.index + am[0].length,
+      });
+    }
+
+    const words: WordTiming[] = [];
+    let lineText = "";
+    let pos = 0;
+    let anchorTime = lineStartMs;
+    const flush = (end: number, time: number) => {
+      for (const ch of rest.slice(pos, end)) {
+        words.push({ startMs: time, durMs: 0, text: ch });
+        lineText += ch;
+      }
+    };
+    for (const a of anchors) {
+      flush(a.index, anchorTime);
+      anchorTime = a.startMs;
+      pos = a.end;
+    }
+    flush(rest.length, anchorTime);
+
+    if (words.length === 0) continue;
+    lines.push({ startMs: lineStartMs, text: lineText, words });
+    rawIndices.push(k);
+  }
+
+  // 稳定排序，rawIndices 随行携带（表必须按时间升序，供时间轴二分查找）
+  const order = lines.map((_, i) => i).sort((a, b) => lines[a].startMs - lines[b].startMs);
+  return {
+    lines: order.map((i) => lines[i]),
+    hasWordTags,
+    rawIndices: order.map((i) => rawIndices[i]),
+  };
+}
+
+/**
+ * 平移单行字符串内的全部时间标签（[mm:ss.fff] 行标签与 <mm:ss.fff> 字标签）。
+ * 逐标签钳到 ≥0；重新格式化为两位分钟 + 3 位毫秒。
+ * 供行级写回（syncEnhancedLrcFromTimeline）对单个物理行做统一 δ 移位。
+ */
+export function shiftTimestampsInLine(line: string, deltaMs: number): string {
+  if (!deltaMs) return line;
+  return line.replace(
+    /([<[])(\d{1,3}):(\d{2})(?:[.:](\d{1,4}))?[>\]]/g,
+    (_m, open: string, mm: string, ss: string, frac: string | undefined) => {
+      const base =
+        Number(mm) * 60000 + Number(ss) * 1000 + Number((frac ?? "0").slice(0, 3).padEnd(3, "0"));
+      const ms = Math.max(0, base + deltaMs);
+      return open === "[" ? formatLrcTimestamp(ms) : formatWordTag(ms);
+    },
+  );
 }
 
 /**

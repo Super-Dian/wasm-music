@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import type { ClipRanges, Lyrics } from "@/data";
+import type { ClipRanges, Lyrics, WordLyricLine, WordTiming } from "@/data";
 import { Message } from "@/utils/message";
 // 显式导入（与仓库其它文件一致）：不依赖 unplugin-vue-components 自动注入，
 // 避免生产构建中 resolveComponent 回退渲染成无样式的未知元素
@@ -12,6 +12,8 @@ const props = withDefaults(
   defineProps<{
     lines: Lyrics;
     enhanced?: boolean;
+    /** 逐字数据源（enhancedLrc 解析副本）：行索引与 lines 对齐；null = 无逐字能力 */
+    wordLines?: WordLyricLine[] | null;
     clipRanges?: ClipRanges | null;
     /** 父级 timelineDirty：是否存在可撤销的时间轴编辑 */
     dirty?: boolean;
@@ -19,13 +21,15 @@ const props = withDefaults(
   {
     lines: () => [],
     enhanced: false,
+    wordLines: null,
     clipRanges: null,
     dirty: false,
   },
 );
 
 const emit = defineEmits<{
-  (e: "commit", lines: Lyrics, globalDelta?: number): void;
+  (e: "commit", lines: Lyrics): void;
+  (e: "commitWords", lineIndex: number, words: WordTiming[]): void;
   (e: "select", index: number): void;
   (e: "reset"): void;
 }>();
@@ -61,6 +65,10 @@ const workingLines = shallowRef<Lyrics>(
 );
 const selectedId = ref<number | null>(null);
 const activeIndex = ref(-1);
+/** 当前活跃词下标（-1 = 无高亮）：仅在 updateActiveIndex 内门控写入（词级频率） */
+const activeWordIndex = ref(-1);
+/** 字条当前选中词下标（依赖 selectedId 行选中） */
+const selectedWordId = ref<number | null>(null);
 const isPlaying = ref(false);
 const hasVideo = ref(false);
 const followPlayhead = ref(true);
@@ -230,6 +238,17 @@ const previewNextRow = computed<PreviewRow | null>(() => {
   return findPreviewRow(start, 1);
 });
 
+/**
+ * 预览当前行的逐字渲染数据：资格不满足（普通模式 / 行级文档 / 行数不齐 /
+ * 文本未归并 / 空行）→ null，模板回退为纯文本展示。
+ */
+const karaokeCurrent = computed(() => {
+  const idx = activeIndex.value;
+  const line = eligibleWordLine(idx);
+  if (!line) return null;
+  return { words: line.words, lineIndex: idx };
+});
+
 function cloneLines(lines: Lyrics): Lyrics {
   return lines.map(([t, s]): [number, string] => [t, s]);
 }
@@ -282,12 +301,60 @@ function findActiveIndex(tMs: number): number {
 function updateActiveIndex() {
   const idx = findActiveIndex(displayTimeMs);
   if (idx !== activeIndex.value) activeIndex.value = idx;
+  updateActiveWord(idx);
+}
+
+/**
+ * 行 i 的逐字资格：逐字模式、数据齐、行数与时间轴对齐、文本一致。
+ * 文本不一致（框内已改但未归并的行）回退纯文本展示，高亮与字条同时停用。
+ */
+function eligibleWordLine(i: number): WordLyricLine | null {
+  const wl = props.wordLines;
+  const lines = workingLines.value;
+  if (!props.enhanced || !wl) return null;
+  if (i < 0 || i >= lines.length || wl.length !== lines.length) return null;
+  const line = wl[i];
+  if (!line || !line.words.length || line.text !== lines[i][1]) return null;
+  return line;
+}
+
+/**
+ * 逐字高亮：行锚定换算（绝对时间 = 时间轴行 start + 词相对 offset），
+ * 色块被拖动时高亮随块走（所见即所得），行级写回归并后与导出真值收敛。
+ * 门控写入：仅词切换时更新 ref，rAF 每帧只读不写（响应式红线）。
+ */
+function updateActiveWord(idx: number) {
+  const line = eligibleWordLine(idx);
+  if (!line) {
+    if (activeWordIndex.value !== -1) activeWordIndex.value = -1;
+    return;
+  }
+  const anchor = workingLines.value[idx][0] - line.startMs;
+  let j = -1;
+  const words = line.words;
+  for (let k = 0; k < words.length; k++) {
+    if (anchor + words[k].startMs <= displayTimeMs) j = k;
+    else break;
+  }
+  if (j !== activeWordIndex.value) activeWordIndex.value = j;
 }
 
 watch([viewStartMs, pxPerSec], syncPlayheadDom);
 
 // 时间表被整体改写（commit/整体偏移/重同步）后，播放指针所在的行可能变化，重算活跃行
 watch(workingLines, updateActiveIndex);
+
+// 字级时间被改写（字条微调/行级写回/撤销）后刷新高亮与字条选中
+watch(
+  () => props.wordLines,
+  () => {
+    updateActiveWord(activeIndex.value);
+  },
+);
+
+watch(selectedId, () => {
+  selectedWordId.value = null;
+});
 
 function seekTo(ms: number) {
   displayTimeMs = Math.max(0, ms);
@@ -309,11 +376,10 @@ function clampLine(i: number, t: number, lines: Lyrics): number {
   return Math.min(Math.max(t, min), max);
 }
 
-function emitCommit(globalDelta?: number) {
+function emitCommit() {
   emit(
     "commit",
     workingLines.value.map(([t, s]): [number, string] => [t, s]),
-    globalDelta,
   );
 }
 
@@ -516,6 +582,70 @@ function alignSelectedToPlayhead() {
   replaceLine(i, t);
 }
 
+/** 选中行的字词条数据（资格不满足 → null，字条整体隐藏） */
+const stripLine = computed(() =>
+  selectedId.value === null ? null : eligibleWordLine(selectedId.value),
+);
+
+function onWordChipClick(j: number) {
+  selectedWordId.value = j;
+  const i = selectedId.value;
+  const line = stripLine.value;
+  // 与色块一致：「点击跳转指针」开启时跳到该词的行锚定时间
+  if (seekOnClick.value && i !== null && line) {
+    seekTo(workingLines.value[i][0] + (line.words[j].startMs - line.startMs));
+  }
+}
+
+/** 字词邻接夹紧后写回父级（enhancedLrc 帧：行内 [prev, next]，首词≥行start，末词≤下一行/时长） */
+function applyWordTime(i: number, j: number, target: number) {
+  const line = stripLine.value;
+  const wl = props.wordLines;
+  if (!line || !wl) return;
+  const words = line.words.map((w): WordTiming => ({ ...w }));
+  const nextLineStart =
+    i + 1 < wl.length
+      ? wl[i + 1].startMs
+      : durationMs.value > 0
+        ? durationMs.value
+        : Number.MAX_SAFE_INTEGER;
+  const min = j === 0 ? line.startMs : words[j - 1].startMs;
+  const max = j < words.length - 1 ? words[j + 1].startMs : nextLineStart;
+  const t = Math.min(Math.max(Math.round(target), min), max);
+  if (t === words[j].startMs) {
+    Message.info("已到达边界");
+    return;
+  }
+  words[j].startMs = t;
+  emit("commitWords", i, words);
+}
+
+function nudgeWord(deltaMs: number) {
+  const i = requireSelection();
+  if (i === null) return;
+  const j = selectedWordId.value;
+  const line = stripLine.value;
+  if (j === null || !line) {
+    Message.info("请先点击选择字词");
+    return;
+  }
+  applyWordTime(i, j, line.words[j].startMs + deltaMs);
+}
+
+function alignWordToPlayhead() {
+  const i = requireSelection();
+  if (i === null) return;
+  const j = selectedWordId.value;
+  const line = stripLine.value;
+  if (j === null || !line) {
+    Message.info("请先点击选择字词");
+    return;
+  }
+  // 播放指针（时间轴帧）→ 字词（enhancedLrc 帧）：行级写回后两帧重合，此式仍通用
+  const target = line.startMs + (displayTimeMs - workingLines.value[i][0]);
+  applyWordTime(i, j, target);
+}
+
 function applyShiftAll() {
   const raw = shiftInput.value.trim();
   const sec = Number(raw);
@@ -544,8 +674,8 @@ function applyShiftAll() {
 
   workingLines.value = lines.map(([t, s]): [number, string] => [t + deltaMs, s]);
   shiftInput.value = "";
-  // 携带「实际应用」的 delta（可能已被钳制）供父级同步逐字歌词
-  emitCommit(deltaMs);
+  // 整体位移由父级从表上逐行推导写回逐字歌词（syncEnhancedLrcFromTimeline）
+  emitCommit();
 }
 
 /** 播放头 rAF 循环：仅播放中运行；每帧只直写 transform/文本 + 条件性 activeIndex */
@@ -662,8 +792,9 @@ onUnmounted(() => {
 <template>
   <div class="lyrics-timeline">
     <UiAlert v-if="enhanced" type="warning" style="margin-bottom: 8px">
-      逐字歌词模式：行级拖拽仅影响行级时间轴，字级时间只随「整体偏移 /
-      开始时间」整体平移；导出时逐字时间以 Enhanced LRC 为准。
+      逐字歌词模式：行级拖拽 /
+      整体偏移会同步平移该句的行级与全部字级时间（保持句内相对间隔）；字级微调请选中行后使用下方「逐字微调」。导出逐字时间以
+      Enhanced LRC 为准，「撤销」可整体回滚。
     </UiAlert>
     <UiAlert v-if="!hasVideo" type="warning" style="margin-bottom: 8px">
       未检测到宿主播放器，无法试听；时间轴仍可编辑。
@@ -721,10 +852,48 @@ onUnmounted(() => {
       <UiButton
         size="small"
         :disabled="!dirty"
-        title="撤销所有时间轴编辑（含整体偏移/开始时间调整与左面板文本改动），恢复到编辑前的原始状态"
+        title="撤销所有时间轴编辑（含整体偏移、逐字微调与左面板文本改动），恢复到编辑前的原始状态"
         @click="emit('reset')"
       >
         撤销
+      </UiButton>
+    </div>
+
+    <!-- 逐字微调字条：选中行后显示其字级时间；点选字词（可试听跳转），
+         按钮做邻接夹紧微调，写回父级 enhancedLrc（行标签不动） -->
+    <div v-if="stripLine" class="lt-wordstrip">
+      <span class="lt-label">逐字微调</span>
+      <button
+        v-for="(w, j) in stripLine.words"
+        :key="j"
+        type="button"
+        class="lt-word-chip"
+        :class="{ 'lt-word-chip-selected': selectedWordId === j }"
+        :title="formatMsFull(w.startMs)"
+        @click="onWordChipClick(j)"
+      >
+        {{ w.text }}
+      </button>
+      <span class="lt-divider"></span>
+      <UiButton size="small" :disabled="selectedWordId === null" @click="nudgeWord(-50)">
+        −50ms
+      </UiButton>
+      <UiButton size="small" :disabled="selectedWordId === null" @click="nudgeWord(-10)">
+        −10ms
+      </UiButton>
+      <UiButton size="small" :disabled="selectedWordId === null" @click="nudgeWord(10)">
+        +10ms
+      </UiButton>
+      <UiButton size="small" :disabled="selectedWordId === null" @click="nudgeWord(50)">
+        +50ms
+      </UiButton>
+      <UiButton
+        size="small"
+        :disabled="selectedWordId === null"
+        title="将选中字词的开始时间设为播放指针当前所在的时间点"
+        @click="alignWordToPlayhead"
+      >
+        对齐到播放指针
       </UiButton>
     </div>
 
@@ -813,7 +982,18 @@ onUnmounted(() => {
       >
         <template v-if="previewCurrentRow">
           <span class="lt-preview-time">{{ previewCurrentRow.time }}</span>
+          <!-- 逐字高亮：资格满足时按词渲染（行锚定，随色块/写回联动），否则回退纯文本 -->
+          <span v-if="karaokeCurrent && previewCurrentRow.text.trim()" class="lt-preview-text">
+            <span
+              v-for="(w, j) in karaokeCurrent.words"
+              :key="j"
+              class="lt-word"
+              :class="{ 'lt-word-sung': j <= activeWordIndex }"
+              >{{ w.text }}</span
+            >
+          </span>
           <span
+            v-else
             class="lt-preview-text"
             :class="{ 'lt-preview-empty-text': !previewCurrentRow.text.trim() }"
           >
@@ -1110,6 +1290,51 @@ onUnmounted(() => {
   color: var(--color-bili-text-muted, #999);
 }
 
+/* 逐字高亮：预览当前行的词序列（已唱词点亮） */
+.lt-word {
+  transition: color 0.12s linear;
+}
+
+.lt-word-sung {
+  color: var(--color-bili-blue, #00aeec);
+}
+
+/* 逐字微调字条：选中行的词 chips + 微调按钮（工具栏下第二行） */
+.lt-wordstrip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-bili-border, #e3e5e7);
+  border-radius: 6px;
+  background: var(--color-bili-bg, #fff);
+}
+
+.lt-word-chip {
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  border: 1px solid var(--color-bili-border, #e3e5e7);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.lt-word-chip:hover {
+  border-color: var(--color-bili-blue, #00aeec);
+}
+
+.lt-word-chip-selected {
+  background: var(--color-bili-blue, #00aeec);
+  border-color: var(--color-bili-blue, #00aeec);
+  color: #fff;
+}
+
 .lt-clip-mask {
   position: absolute;
   top: 0;
@@ -1289,5 +1514,34 @@ body[data-theme="dark"] .lt-scrollbar-thumb:hover {
 body[arco-theme="dark"] .lt-divider,
 body[data-theme="dark"] .lt-divider {
   background: #444;
+}
+
+body[arco-theme="dark"] .lt-word-sung,
+body[data-theme="dark"] .lt-word-sung {
+  color: #33c5ff;
+}
+
+body[arco-theme="dark"] .lt-wordstrip,
+body[data-theme="dark"] .lt-wordstrip {
+  background: #1f1f1f;
+  border-color: #444;
+}
+
+body[arco-theme="dark"] .lt-word-chip,
+body[data-theme="dark"] .lt-word-chip {
+  border-color: #444;
+  color: #e0e0e0;
+}
+
+body[arco-theme="dark"] .lt-word-chip:hover,
+body[data-theme="dark"] .lt-word-chip:hover {
+  border-color: #00aeec;
+}
+
+body[arco-theme="dark"] .lt-word-chip-selected,
+body[data-theme="dark"] .lt-word-chip-selected {
+  background: #00aeec;
+  border-color: #00aeec;
+  color: #fff;
 }
 </style>

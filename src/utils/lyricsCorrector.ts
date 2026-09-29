@@ -1,6 +1,5 @@
 import { diffChars } from "diff";
 import type { Lyrics } from "@/data";
-import { logger } from "./logger";
 
 type DiffPart = { value: string; added?: boolean; removed?: boolean };
 
@@ -85,8 +84,10 @@ function stripMusicNotes(text: string): string {
 
 /**
  * 判断一行是否是元信息（key:value / key-value 格式或标题行）。
+ * 导出供逐字歌词的「智能保留歌词正文」在解析后的行文本上过滤（原始 Enhanced
+ * 行以 `<...>` 开头会击穿 key:value 正则，必须先解析再判断）。
  */
-function isMetaLine(content: string): boolean {
+export function isMetaLine(content: string): boolean {
   const trimmed = content.trim();
   // 空行
   if (!trimmed) return true;
