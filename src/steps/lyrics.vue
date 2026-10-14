@@ -350,6 +350,73 @@ function parseLrcToLyrics(lrcText: string): Array<[number, string]> {
 }
 
 /**
+ * 视频时长（ms），截断超出时长歌词的统一基准。
+ * 优先取当前分 P 的 pages[].duration（videoData.duration 在多 P 视频上是总时长），
+ * episode.ts 已将分集 duration 归一为当前分集时长；未知（0）时不截断。
+ */
+const videoDurationMs = computed(() => {
+  const vd = fromData.videoData;
+  if (!vd) return 0;
+  const page = vd.pages?.find((p) => p.cid === vd.cid);
+  const sec = page?.duration || vd.duration || 0;
+  return sec > 0 ? sec * 1000 : 0;
+});
+
+/** mm:ss 紧凑格式（警告/提示文案用） */
+function formatClock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/**
+ * 文本级截断：按行首时间戳丢弃开始时间 ≥ 视频时长的物理行。
+ * 无时间戳的行（元信息/空行）原样保留；多时间戳行以首个为准；
+ * 增强歌词行（`[mm:ss.xxx]<...>`）同样以行首标签判定。
+ * 时长未知（videoDurationMs=0）或无文本时原样返回。
+ */
+function truncateLrcText(text: string): string {
+  const dur = videoDurationMs.value;
+  if (dur <= 0 || !text) return text;
+  const timestamp = /\[(\d{1,3}):(\d{2})(?:[.:](\d{1,4}))?\]/;
+  return text
+    .split(/\r?\n/)
+    .filter((line) => {
+      const match = line.match(timestamp);
+      if (!match) return true;
+      const ms =
+        Number(match[1]) * 60000 +
+        Number(match[2]) * 1000 +
+        Number((match[3] ?? "0").slice(0, 3).padEnd(3, "0"));
+      return ms < dur;
+    })
+    .join("\n");
+}
+
+/** 结构级截断：丢弃 startMs ≥ 视频时长的逐字行；时长未知原样返回 */
+function truncateWordLyricsToDuration(lines: WordLyrics): WordLyrics {
+  const dur = videoDurationMs.value;
+  if (dur <= 0) return lines;
+  return lines.filter((line) => line.startMs < dur);
+}
+
+/**
+ * 在线歌词（原始 LRC）超出视频时长的信息：last=末句开始时间，dropped=超长句数。
+ * null = 未超出或时长/歌词未知。用于选源提醒与 Tab1 常驻警告。
+ */
+function getOnlineLyricsOverflow(lrcText: string): { last: number; dropped: number } | null {
+  const dur = videoDurationMs.value;
+  if (dur <= 0 || !lrcText) return null;
+  const parsed = parseLrcToLyrics(lrcText);
+  if (!parsed.length) return null;
+  const dropped = parsed.filter(([ms]) => ms >= dur).length;
+  if (!dropped) return null;
+  return { last: parsed[parsed.length - 1][0], dropped };
+}
+
+/** 当前选中在线歌词源的超时长信息（Tab1 常驻警告用；基于原始 LRC，与框内截断状态无关） */
+const onlineLyricsOverflow = computed(() => getOnlineLyricsOverflow(onlineLyrics.value));
+
+/**
  * 行级写回：把 _lyricsBody 的行级时间按行整体平移同步进 enhancedLrc
  * （该行行标签 + 全部字标签同移，行内相对间隔不变）。
  *
@@ -387,7 +454,7 @@ function syncEnhancedLrcFromTimeline(): boolean {
 
 /**
  * 物化当前模式下的时间轴行（与 next() 的三模式取数逻辑同构）。
- * online → _lyricsBody（空时兜底解析右侧编辑框）；
+ * online → _lyricsBody（空时仅在已点「使用在线歌词」下兜底解析右侧编辑框）；
  * ai-corrected → _lyricsBody；
  * ai → body[i].from ↔ _editBody 行。
  */
@@ -396,6 +463,10 @@ function getTimelineLines(): Lyrics {
   if (!data) return [];
   if (lyricsMode.value === "online") {
     if (data._lyricsBody?.length) return data._lyricsBody;
+    // 未点「使用在线歌词」不兜底解析右侧候选框：无 AI 字幕时 editLyrics 默认进
+    // online 模式，且 searchOnlineLyrics 会自动选中首个结果填充候选框——
+    // 无条件解析会让时间轴显示用户从未应用过的在线歌词（左面板仍是空的）
+    if (!useOnlineLyrics.value) return [];
     return parseLrcToLyrics(editableOnlineLyrics.value);
   }
   if (lyricsMode.value === "ai-corrected" && data._lyricsBody?.length) {
@@ -754,6 +825,8 @@ function applyFormatting() {
     } else {
       lines = wordLyrics;
     }
+    // 超时长截断：候选框只保留视频时长内的行（时长未知时为原样）
+    lines = truncateWordLyricsToDuration(lines);
 
     let enhanced = wordLyricsToEnhancedLrc(lines);
 
@@ -786,9 +859,9 @@ function applyFormatting() {
     editableOnlineLyrics.value = enhanced;
   } else {
     if (!cachedNormalLyrics.value) return;
-    editableOnlineLyrics.value = onlineLyricsContentFormat(
-      lyricsBodySwitch,
-      cachedNormalLyrics.value,
+    // 超时长截断：格式化输出后再按行首时间戳裁掉超出视频时长的行
+    editableOnlineLyrics.value = truncateLrcText(
+      onlineLyricsContentFormat(lyricsBodySwitch, cachedNormalLyrics.value),
     );
   }
 }
@@ -932,6 +1005,14 @@ watch(onlineLyricsIndex, async (value) => {
     // WYSIWYG：初始化缓存并应用当前格式化选项
     cachedNormalLyrics.value = lrc;
     applyFormatting();
+    // 超出视频时长：大概率选错歌（自动选中的首个候选尤其常见），立即提醒；
+    // applyFormatting 已把候选框截断，应用/时间轴只会收到截断后的内容
+    const overflow = getOnlineLyricsOverflow(lrc);
+    if (overflow) {
+      Message.warning(
+        `在线歌词时长（${formatClock(overflow.last)}）超出视频时长（${formatClock(videoDurationMs.value)}），可能选错歌曲；使用时自动截断超出的 ${overflow.dropped} 句`,
+      );
+    }
     // 已在使用在线歌词时更换歌词源：自动重新应用到左侧文本与时间轴，
     // 否则左侧仍显示旧源的内容（需要手动再点一次「使用在线歌词」）
     if (useOnlineLyrics.value) {
@@ -966,6 +1047,12 @@ function replaceWithOnlineLyrics() {
 
   isReplacingLyrics = true;
   try {
+    // 超时长收口：手动粘贴的完整版歌词也在此截断，右框与 _lyricsBody 保持同源
+    const truncatedBox = truncateLrcText(editableOnlineLyrics.value);
+    if (truncatedBox !== editableOnlineLyrics.value) {
+      editableOnlineLyrics.value = truncatedBox;
+      Message.info("已自动截断超出视频时长的歌词行");
+    }
     const parsedLyrics = parseLrcToLyrics(editableOnlineLyrics.value);
     if (parsedLyrics.length === 0) {
       Message.warning("在线歌词中没有有效时间轴，请开启时间轴后再使用");
@@ -995,14 +1082,19 @@ function replaceWithOnlineLyrics() {
 
 /** 撤销：一键恢复为原始 AI 歌词状态（不论当前处于何种中间状态） */
 function undoReplaceLyrics() {
-  if (!editLyricsData.value?.data || !originalAiText.value) return;
+  const data = editLyricsData.value?.data;
+  if (!data) return;
+  // 无 AI 字幕时 originalAiText 为空——旧守卫 `!originalAiText` 会直接 return，
+  // 导致「使用在线歌词」点了无法取消；此处仍允许清空。但模式须保持 online：
+  // ai 路由会拿空 body 做行数校验（"" split 出 1 行 vs 0 行），卡死 next()。
+  const hasAiBody = data.body.length > 0;
   markInternalEditBodyWrite();
-  editLyricsData.value.data._editBody = originalAiText.value;
-  editLyricsData.value.data._lyricsBody = [];
+  data._editBody = originalAiText.value;
+  data._lyricsBody = [];
   timelineDirty.value = false;
   smartCorrected.value = false;
-  lyricsMode.value = "ai";
-  subtitleEditMode.value = "ai";
+  lyricsMode.value = hasAiBody ? "ai" : "online";
+  subtitleEditMode.value = hasAiBody ? "ai" : "online";
   originalEditBody.value = "";
   useOnlineLyrics.value = false;
   lyricsType.value = "normal";
@@ -1022,7 +1114,16 @@ function applyEnhancedLyrics() {
   if (!editLyricsData.value?.data) return;
 
   const boxEmpty = !editableOnlineLyrics.value.trim();
-  let parsed = boxEmpty ? null : parseEnhancedLrc(editableOnlineLyrics.value);
+  let parsed = null;
+  if (!boxEmpty) {
+    // 超时长收口：先截断右框再解析（手动粘贴旁路），框与 _lyricsBody/_editBody 同源
+    const truncatedBox = truncateLrcText(editableOnlineLyrics.value);
+    if (truncatedBox !== editableOnlineLyrics.value) {
+      editableOnlineLyrics.value = truncatedBox;
+      Message.info("已自动截断超出视频时长的歌词行");
+    }
+    parsed = parseEnhancedLrc(editableOnlineLyrics.value);
+  }
 
   if (!parsed || parsed.lines.length === 0) {
     if (!boxEmpty) {
@@ -1033,9 +1134,11 @@ function applyEnhancedLyrics() {
       Message.warning("当前歌曲无逐字歌词数据");
       return;
     }
-    const wordLyrics = parseYrc(onlineYrc.value);
+    const wordLyrics = truncateWordLyricsToDuration(parseYrc(onlineYrc.value));
     if (wordLyrics.length === 0) {
-      Message.warning("逐字歌词解析失败或为空");
+      Message.warning(
+        videoDurationMs.value > 0 ? "逐字歌词全部超出视频时长或解析失败" : "逐字歌词解析失败或为空",
+      );
       return;
     }
     editableOnlineLyrics.value = wordLyricsToEnhancedLrc(wordLyrics);
@@ -1123,6 +1226,13 @@ function handleLeftPanelPaste(event: ClipboardEvent) {
 function handleOk() {
   if (lyricsMode.value === "online") {
     const data = editLyricsData.value!.data!;
+    // 超时长收口：确定前统一截断右框（覆盖手动粘贴后未点「使用在线歌词」直接确定的路径），
+    // 其后所有归并分支都基于截断后的框解析
+    const truncatedBox = truncateLrcText(editableOnlineLyrics.value);
+    if (truncatedBox !== editableOnlineLyrics.value) {
+      editableOnlineLyrics.value = truncatedBox;
+      Message.info("已自动截断超出视频时长的歌词行");
+    }
 
     if (fromData.useEnhancedLyrics) {
       // 逐字歌词归并契约：时间权威 _lyricsBody（总被重基）＞ 框 ＞ enhancedLrc；
@@ -1624,6 +1734,12 @@ function openWorkshop(item?: SubTitle) {
                     ↩ 撤销
                   </UiButton>
                 </div>
+                <UiAlert v-if="onlineLyricsOverflow" type="warning" style="margin-bottom: 10px">
+                  ⚠️ 在线歌词时长（{{ formatClock(onlineLyricsOverflow.last) }}）超出视频时长（{{
+                    formatClock(videoDurationMs)
+                  }}），大概率选错了歌曲；下方编辑框与「使用在线歌词」、时间轴均已自动截断超出的
+                  {{ onlineLyricsOverflow.dropped }} 句，可换选其它搜索候选核对。
+                </UiAlert>
                 <UiAlert type="info" style="margin-bottom: 10px">
                   💡
                   使用在线歌词：勾选后会自动替换歌词并使用在线歌词的时间轴。需要调整首句出现位置时，请到「时间轴」标签页用「整体偏移」或拖动色块对齐。为了方便对齐，可以勾选「智能保留歌词正文（保留时间轴）」快速删除在线歌词中的非正文部分（如标题，歌手）。若提示无时间轴，应当勾选「时间轴」选项。

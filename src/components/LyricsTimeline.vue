@@ -357,7 +357,10 @@ watch(selectedId, () => {
 });
 
 function seekTo(ms: number) {
-  displayTimeMs = Math.max(0, ms);
+  // 时长已知时钳到 [0, 时长]：浏览器 seek 不会超过 duration，放任虚拟指针
+  // 越过会造成「页面指针在走、浏览器播放已暂停」的错位
+  const max = durationMs.value > 0 ? durationMs.value : Number.MAX_SAFE_INTEGER;
+  displayTimeMs = Math.min(Math.max(0, ms), max);
   syncPlayheadDom();
   writeStatusTime();
   updateActiveIndex();
@@ -370,9 +373,18 @@ function seekTo(ms: number) {
   }
 }
 
+/**
+ * 行 i 的上界：邻接下一句 start；末行不越过歌曲结束（时长未知时不限制）。
+ * 末行已越过时长（历史数据/时长变化）时以当前位置为上界——不再继续右移，但可拖回。
+ */
+function lineMax(i: number, lines: Lyrics): number {
+  if (i < lines.length - 1) return lines[i + 1][0];
+  return durationMs.value > 0 ? Math.max(lines[i][0], durationMs.value) : Number.MAX_SAFE_INTEGER;
+}
+
 function clampLine(i: number, t: number, lines: Lyrics): number {
   const min = i > 0 ? lines[i - 1][0] : 0;
-  const max = i < lines.length - 1 ? lines[i + 1][0] : Number.MAX_SAFE_INTEGER;
+  const max = lineMax(i, lines);
   return Math.min(Math.max(t, min), max);
 }
 
@@ -416,7 +428,7 @@ function applyDrag(clientX: number) {
   const deltaPx = clientX - drag.startClientX;
   if (Math.abs(deltaPx) > MOVE_THRESHOLD_PX) drag.moved = true;
   const min = i > 0 ? lines[i - 1][0] : 0;
-  const max = i < lines.length - 1 ? lines[i + 1][0] : Number.MAX_SAFE_INTEGER;
+  const max = lineMax(i, lines);
   let t = drag.startMs + (deltaPx / pxPerSec.value) * 1000;
   // 磁吸播放头（目标须在邻接边界内才吸附）
   if (Math.abs(t - displayTimeMs) < SNAP_MS && displayTimeMs >= min && displayTimeMs <= max) {
@@ -660,8 +672,15 @@ function applyShiftAll() {
   // 钳制的是「统一 delta」而不是逐行 Math.max——逐行钳制会让出界行堆叠在 0、破坏行距。
   const requested = Math.round(sec * 1000);
   const minDelta = -lines[0][0]; // 首句最早对齐 00:00（表有序 → 全表 ≥0）
+  // 末句上界地板为 0：歌词已超出视频时长时（在线整首歌词 vs 短视频/片段），
+  // 不地板的 maxDelta 为负——Math.min 会把正向请求钳成负 delta（info 显示
+  // 「-xxx 秒」并整表倒退），且 deltaMs 恒≠0 绕过下方边界拒绝，表现为
+  // 触碰边界不回退。地板到 0 后区间 [minDelta, maxDelta] 恒非空、
+  // 钳制结果与请求同号：超长歌词只允许往回收，不允许继续右移。
   const maxDelta =
-    durationMs.value > 0 ? durationMs.value - lines[lines.length - 1][0] : Number.MAX_SAFE_INTEGER;
+    durationMs.value > 0
+      ? Math.max(0, durationMs.value - lines[lines.length - 1][0])
+      : Number.MAX_SAFE_INTEGER;
   const deltaMs = Math.min(Math.max(requested, minDelta), maxDelta);
 
   if (deltaMs !== requested) {
@@ -734,15 +753,24 @@ function handleEnded() {
   stopPlayheadLoop();
 }
 
+/** 时长同步：mounted 时元数据可能未就绪（duration 为 NaN），此后由事件补写，
+ * 否则 applyShiftAll 的歌曲结束边界会静默缺失（maxDelta 恒为 MAX） */
+function handleDurationChange() {
+  if (!video) return;
+  durationMs.value = Number.isFinite(video.duration) ? video.duration * 1000 : 0;
+}
+
 onMounted(() => {
   video = document.querySelector(`.bpx-player-video-wrap video`);
   if (video) {
     hasVideo.value = true;
-    durationMs.value = Number.isFinite(video.duration) ? video.duration * 1000 : 0;
+    handleDurationChange();
     displayTimeMs = video.currentTime * 1000;
     video.addEventListener("play", handlePlay);
     video.addEventListener("pause", handlePause);
     video.addEventListener("ended", handleEnded);
+    video.addEventListener("loadedmetadata", handleDurationChange);
+    video.addEventListener("durationchange", handleDurationChange);
     if (!video.paused) {
       isPlaying.value = true;
       startPlayheadLoop();
@@ -779,6 +807,8 @@ onUnmounted(() => {
     video.removeEventListener("play", handlePlay);
     video.removeEventListener("pause", handlePause);
     video.removeEventListener("ended", handleEnded);
+    video.removeEventListener("loadedmetadata", handleDurationChange);
+    video.removeEventListener("durationchange", handleDurationChange);
     video = null;
   }
   resizeObserver?.disconnect();

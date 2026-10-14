@@ -112,6 +112,7 @@ Key `userConfig` fields:
 - **对齐只在时间轴 Tab**：原「第一句歌词开始时间」输入已删除（与时间轴「整体偏移」重复）——首句位置用整体偏移/行级拖拽/对齐到播放指针调整，时长边界由 `applyShiftAll` 的统一位移钳制与 `clampLine` 覆盖。
 - `useOnlineLyrics` flag controls: disables max-length validation, enables OK button, disables smart correction.
 - **逐字歌词以右侧编辑框为源**（`applyEnhancedLyrics`/`handleOk` 走 `parseEnhancedLrc` 直读手改内容，不覆写框）：智能保留（`isMetaLine` 在**解析后的行文本**上过滤——原始 Enhanced 行以 `<...>` 开头会击穿 key:value 正则）与手动删行/改词都与普通模式同口径生效；框非空但无时间轴（如勾「纯文本」）报「没有有效时间轴」，空框才回退 YRC。
+- **超时长在线歌词截断**：基准 `videoDurationMs`（优先当前分 P `pages[].duration`——多 P 的 `videoData.duration` 是总时长；未知=0 不截断）。选源加载成功即 `Message.warning` 提醒可能选错歌，Tab1 常驻 `UiAlert`（`onlineLyricsOverflow` computed，基于原始 LRC）。截断统一收口：`applyFormatting` 输出（`truncateLrcText` 按行首时间戳文本级裁剪 / `truncateWordLyricsToDuration` 逐字行级）使候选框永远只含时长内内容；手动粘贴旁路在 `replaceWithOnlineLyrics`、`applyEnhancedLyrics`（含空框回退 YRC 路径）与 `handleOk` 的 online 入口同样先截断再解析，保证右框与 `_lyricsBody`/`_editBody` 同源、N↔N 不变式不被破坏。时间轴侧兜底：`seekTo` 钳到 `[0, 时长]`、末行拖拽/微调上界为时长（`lineMax`，已越界的历史行以当前位置为上界可拖回），杜绝「页面指针越过时长、浏览器播放已暂停」的错位与超长块。
 
 **External Lyrics** (`fromData.externalLyrics`):
 
@@ -141,12 +142,12 @@ Key `userConfig` fields:
 - **不支持插删块**：N 行文本 ↔ N 时间戳是 `next()`/`handleOk` 硬不变式，ai 模式还被 `body` zip 锁死。**合并歌词工作流** = 把块拖到极短 + 左面板把文本挪进前/后一句 + **保留空行**（行数不变）。空行渲染：预览上下句跳过、当前句显示「（空行）」，时间轴块为细线标记。
 - **渲染要点**：歌词块**不设 padding、不设最小宽度**（border-box 下 `width:0` 会被 padding+border 撑到 ~18px 压进下一句）；可见窗口行过滤；等时间戳合法、按序存储。
 - **播放指针**（界面对播放头的统一称呼）：`displayTimeMs` 非响应式、rAF 循环仅在播放中运行，每帧只直写 `transform`/状态栏文本（内容未变不写 DOM），活跃行二分查找跨句才更新；三个拖拽态（块拖/平移/滚动条）共享一对 document 监听 + rAF 分支。**禁止展开原生 MouseEvent**（clip.vue 曾因此丢 `clientX`）。
-- **数据流**：`getTimelineLines()` 按三模式物化（online/ai-corrected 读 `_lyricsBody`，纯 ai 为 `body.from × _editBody` zip）→ `onTimelineCommit` 行数守恒校验、**ai → ai-corrected 双 ref 提升**（否则 `next()` 只读 `body[].from` 会静默丢编辑）。编辑侧一律**源视频时间**（clip/speed 前），导出时才由 `processLyrics` 换算。
-- **溢出检查**：整体偏移钳制**统一位移量**到 `[-首句, 时长-末句]`（逐行 clamp 会让边界行堆叠破坏行距），被钳制时 info 提示实际生效值；字条微调按行内词邻接 + `[行start, 下一行start|时长]` 钳制。原「开始时间」输入及其 `handleOk` 时长校验已删除。
+- **数据流**：`getTimelineLines()` 按三模式物化（online/ai-corrected 读 `_lyricsBody`，纯 ai 为 `body.from × _editBody` zip；**online 的右框兜底解析需 `useOnlineLyrics` 为真**——无 AI 字幕时 `editLyrics` 默认进 online 模式且自动搜索会填充候选框，无条件解析会让时间轴显示从未应用过的在线歌词）→ `onTimelineCommit` 行数守恒校验、**ai → ai-corrected 双 ref 提升**（否则 `next()` 只读 `body[].from` 会静默丢编辑）。编辑侧一律**源视频时间**（clip/speed 前），导出时才由 `processLyrics` 换算。
+- **溢出检查**：整体偏移钳制**统一位移量**到 `[-首句, max(0, 时长-末句)]`（逐行 clamp 会让边界行堆叠破坏行距），被钳制时 info 提示实际生效值。**上界必须地板到 0**：歌词超出视频时长时（在线整首 vs 短片段）裸的 `时长-末句` 为负，`Math.min` 会把正向请求钳成负 delta（info 显示异常负数并整表倒退）且绕过 `deltaMs===0` 的边界拒绝——地板后区间恒非空、钳制与请求同号，超长歌词只回收不右移；时长未知（`durationMs=0`）时上界为 `MAX`（右边界缺失，由 `loadedmetadata`/`durationchange` 监听补写时长）。字条微调按行内词邻接 + `[行start, 下一行start|时长]` 钳制。原「开始时间」输入及其 `handleOk` 时长校验已删除。
 - **同步 watcher（`_editBody → _lyricsBody` 单向）**：非 online、行数一致才回写文本（时间戳不动）。同一 watcher 负责**文本编辑激活撤销**：非抑制、非 online 的净变更拍「编辑前」基线（有表用表、无表用编辑前 zip，oldBody 为敲键前值）并置 `timelineDirty`；程序性写入（`editLyrics`/`undoReplace`/智能纠错/`resetTimelineEdits`）必须先 `markInternalEditBodyWrite()`（suppress + nextTick 复位），否则重开工作台撤销就亮。
 - **撤销（`resetTimelineEdits`）**：三方基线快照 `_lyricsBody` + `enhancedLrc` + `_editBody`（在 dirty false→true 的全部入口同刻捕获），一键整体回滚；空基线防御、恢复后按钮须熄灭（不自激活）。
 - **⚠️ `smartCorrected` 必须独立于 `lyricsMode`**：时间轴编辑会把 `ai` 提升为 `ai-corrected`（路由需要），再用 `lyricsMode === 'ai-corrected'` 判断智能纠错会误显示「已纠错」、误入取消分支清空 `_lyricsBody`。
-- **online 模式边界**：文本权威在右侧编辑框，左面板文本不参与同步/激活/导出（`handleOk` 以右侧 parse 为准）。
+- **online 模式边界**：文本权威在右侧编辑框，左面板文本不参与同步/激活/导出（`handleOk` 以右侧 parse 为准）。无 AI 字幕时「使用在线歌词」仍可取消（`undoReplaceLyrics` 不再被空 `originalAiText` 守卫拦截），但模式必须保持 `online`——回 `ai` 会让空 body 被行数校验卡死 `next()`。
 - **联动**：时间轴选中 → 左面板 `focus + setSelectionRange` 跳转整行（软换行由浏览器算准；面板 `display:none` 时直接跳过）；「点击跳转指针」与「跟随播放指针」是**独立开关**；换源自动重应用、行数实时警告见工作台节。
 - **增强歌词行级写回（`syncEnhancedLrcFromTimeline`）**：每次 commit 按行计算 `delta = _lyricsBody[i][0] − enhancedLrc行start`，经 `shiftTimestampsInLine` 对该物理行的行标签+全部字标签统一平移（行内间距不变、逐标签钳 ≥0、幂等、行数不齐跳过并 warn）——行级拖拽/整体偏移**全部进导出**，替代旧 `shiftEnhancedLrc`/`globalDelta` 通道（防双重平移，`commit` emit 不再带 delta）。字符串手术而非整表重序列化：行级文档与框内元信息行字节保真。
 - **handleOk 归并契约（逐字）**：时间权威 `_lyricsBody`（总被重基）＞ 框 ＞ `enhancedLrc`；文本权威框 ＞ `enhancedLrc`；字条微调存于 `enhancedLrc`，**`textsDiffer` 门**（框文本与 enhancedLrc 文本有差异才按框重建）保住它——否则 `watch(formatKey)` 用 pristine 重建框后会静默丢掉字条编辑。行数不齐警告保时间轴；非 dirty 整表从框重建。
